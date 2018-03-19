@@ -1,0 +1,5 @@
+.DS_Store
+breakout.*
+checkpoint
+network_model.*
+openaigym.*

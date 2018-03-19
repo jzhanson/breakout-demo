@@ -16,11 +16,11 @@ def tf_shape_to_np_shape(shape):
 
 class QNetwork():
 
-    def __init__(self, obs_shape, num_actions, debug=False,
+    def __init__(self, sess, obs_shape, num_actions, debug=False,
         learning_rate=1e-4):
 
         self.learning_rate = learning_rate
-        self.sess = tf.Session()
+        self.sess = sess
 
         # By passing observation_space and num_actions, we don't have to have
         # an gym env in this class too.
@@ -29,7 +29,6 @@ class QNetwork():
         self.obs_shape = obs_shape
         self.num_actions = num_actions
 
-
         self.create_model()
         self.sess.run(tf.global_variables_initializer())
 
@@ -37,15 +36,11 @@ class QNetwork():
     # create_model: Initializes a tensorflow model
     def create_model(self):
         with self.sess:
-            '''
-            self.state_ph = tf.placeholder(dtype=tf.float32,
-                shape=self.obs_shape)
-            '''
             self.state_ph = tf.placeholder(dtype=tf.float32,
                 shape=self.obs_shape)
 
-            self.action_ph = tf.placeholder(shape=[None], dtype=tf.int32)
-            self.expected_ph = tf.placeholder(tf.float32, shape=[None])
+            self.action_ph = tf.placeholder(shape=[None], dtype=tf.uint8)
+            self.expected_ph = tf.placeholder(shape=[None], dtype=tf.float32)
 
             # Convolution layers go here
             conv1 = tf.layers.conv2d(
@@ -73,7 +68,10 @@ class QNetwork():
                 activation=tf.nn.relu
             )
 
-            fully_connected = tf.contrib.layers.fully_connected(conv3,
+            conv3_flat = tf.reshape(conv3, [-1,
+                np.prod(np.array(conv3.shape[1:]))])
+
+            fully_connected = tf.contrib.layers.fully_connected(conv3_flat,
                 512, activation_fn=tf.nn.relu)
 
             self.qvalue_logits = tf.contrib.layers.fully_connected(
@@ -84,7 +82,7 @@ class QNetwork():
 
             self.action = tf.argmax(input=self.qvalue_logits, axis=1)
 
-            # does same thing as tf.gather
+            # TODO: does same thing as tf.gather - can simplify?
             self.prediction = tf.reduce_sum(
                 tf.multiply(
                     self.qvalue_logits,
@@ -172,7 +170,7 @@ class Replay_Memory():
         # the "right" side is last-in (most recently added)
         if self.current_size == self.memory_size:
             # Discard oldest transition
-            (prev_obs, action, reward, done, obs) = self.memory.popleft()
+            self.memory.popleft()
             self.current_size -= 1
 
         self.memory.append(transition)
@@ -181,17 +179,51 @@ class Replay_Memory():
 
 
 class DQN_Agent():
+
+    def __init__(self, sess, environment_name, render=False, video_capture=False):
+
+        self.environment_name = environment_name
+        self.render = render
+        self.env = gym.make(self.environment_name)
+
+        self.video_capture = video_capture
+
+        # batch, in_height, in_width, in_channels
+        self.qn = QNetwork(sess, (None, 110, 84, 4),
+            self.env.action_space.n, learning_rate=1e-4)
+
+        # Annealed linearly from 1 to 0.1 over the first million frames then
+        # fixed afterwards
+        self.epsilon_max = 1
+        self.epsilon_min = 0.1
+
+        self.discount_factor = 0.99
+        self.training_iterations = 1e7  # 10,000,000
+        # We initialize last_three_frames to be all zeros 110x84 arrays at
+        # first, which will end up making relatively little difference in the
+        # long run. Can use uint8 to save space but we'll just use default float
+        # for now
+        self.last_three_frames = deque([np.zeros((110, 84), dtype=np.uint8),
+            np.zeros((110, 84), dtype=np.uint8), np.zeros((110, 84),
+            dtype=np.uint8)])
+
+        self.replay_memory = Replay_Memory()
+        self.burn_in_memory()
+
     # We use the following three functions to wrap the last 3 frames in with the
     # current frame - elsewhere, the state is treated as an opaque thing.
     def preprocess(self, frame):
         # grayscaling
         image = frame
+        # 0.299, 0.587, 0.114
         # Other option is 0.2126, 0.7152, 0.0722
-        gray_image = image[...,:3].dot([0.299, 0.587, 0.114])
+        gray_image = image[...,:3].dot([0.2126, 0.7152, 0.0722])
         # magic numbers that people use to reduce images grayscale
 
         # Resizing to 110x84 since Tensorflow doesn't care about square images
         # Could consider downsampling in a more intelligent way
+        #
+        # Could add in anti-aliasing=true but need newest scikit-image
         gray_small_image = resize(gray_image, (110, 84))
 
         # Include last 3 frames as well, in the order earliest to latest
@@ -201,10 +233,10 @@ class DQN_Agent():
             axis=0), gray_small_image, axis=0)
 
         # Drop oldest frame and add newest
-        self.last_three_frames[1:].append(gray_small_image)
+        self.last_three_frames.popleft()
+        self.last_three_frames.append(gray_small_image)
 
         return obs
-
 
     # step function we use as a wrapper for env.step
     def step(self, action):
@@ -219,39 +251,6 @@ class DQN_Agent():
         return self.preprocess(obs)
 
 
-
-    def __init__(self, environment_name, render=False, video_capture=False):
-
-        self.environment_name = environment_name
-        self.render = render
-        self.env = gym.make(self.environment_name)
-
-        self.update_frequency = 100
-        self.video_capture = video_capture
-
-        # batch, in_height, in_width, in_channels
-        self.qn = QNetwork((None, 110, 84, 4),
-            self.env.action_space.n, learning_rate=1e-4)
-
-        # Annealed linearly from 1 to 0.1 over the first million frames then
-        # fixed afterwards
-        self.epsilon_max = 1
-        self.epsilon_min = 0.1
-
-        self.discount_factor = 0.99
-        self.training_iterations = 1e7  # 10,000,000
-        # We initialize last_three_frames to be all zeros 110x84 arrays at
-        # first, which will end up making relatively little difference in the
-        # long run. Can use uint8 to save space but we'll just use default float
-        # for now
-        self.last_three_frames = [np.zeros((110, 84), dtype=np.uint8),
-            np.zeros((110, 84), dtype=np.uint8), np.zeros((110, 84),
-            dtype=np.uint8)]
-
-        self.replay_memory = Replay_Memory()
-        self.burn_in_memory()
-
-
     def epsilon_greedy_policy(self, q_values, epsilon):
         # Compute max action and assign it a probability of 1-epsilon
         q_values = q_values.reshape((-1,)) # WARNING: we're flattening q_values
@@ -261,8 +260,6 @@ class DQN_Agent():
             res = action
             if np.random.rand() < epsilon:
                 new_action = self.env.action_space.sample()
-                # while (new_action == res):
-                #     new_action = self.env.action_space.sample()
                 res = new_action
             return res
         return policy
@@ -283,13 +280,13 @@ class DQN_Agent():
 
     def train(self):
         if self.video_capture:
-            self.env = gym.wrappers.Monitor(self.env, '.', force=True,
-                video_callable=lambda iterations: iterations % 100 == 0)
+            self.env = gym.wrappers.Monitor(self.env, './training_videos',
+                force=True, video_callable=lambda episodes: episodes % 10
+                == 0)
 
-        iterations = 0 # number of episodes
+        episodes = 0
+        updates = 0
 
-        updates = 0 # number of times we add to the memory (number of memories)
-        rewards = []
         epsilon = self.epsilon_max
         decay_rate = (self.epsilon_max - self.epsilon_min)  \
             / self.training_iterations
@@ -303,21 +300,35 @@ class DQN_Agent():
 
         loss = None
         t = 1.0
+        current_updates = 0
 
         training_rewards = []
+        test_rewards = []
         last_20_episode_rewards = deque([])
         cur_total_reward = 0
 
-        while iterations < self.training_iterations:
+        while episodes < self.training_iterations:
 
-            if self.render and iterations % 100 == 0 and not done:
-                env.render()
+            if self.render:
+                self.env.render()
 
             if done:
-                iterations += 1
+                print('training reward: %d loss: %d epsilon: %d episodes: %d' %
+                    (cur_total_reward, loss, epsilon, episodes))
+                print('current updates: %d total updates %d' % (current_updates,
+                    total_updates))
+
+                if episodes % 100 == 0:
+                    cur_reward = self.test()
+                    print('test rewards: %d' % cur_reward)
+                    test_rewards.append(cur_reward)
+
+
+                episodes += 1
                 obs = self.reset()
                 loss = None
                 t = 1.0
+                current_updates = 0
 
                 # last_20_episode_rewards is used for plotting training rewards
                 if len(last_20_episode_rewards) == 20:
@@ -329,62 +340,6 @@ class DQN_Agent():
                     cur_total_reward = 0
 
 
-            epsilon = self.epsilon_max - decay_rate * iterations
-
-            prev_obs = obs
-            policy = self.epsilon_greedy_policy(self.qn.get_qvalues(prev_obs),
-                epsilon)
-            action = self.sample_action(policy)
-
-            # Take action and train QNetwork
-            # Do we need to discount reward here?
-            obs, reward, done, info = self.step(action)
-
-            cur_total_reward += reward
-            if done:
-                print(cur_total_reward)
-
-            # Do we just append to our replay memory and not train on the
-            # transition that just happened?
-            '''
-            cur_loss, cur_pred, cur_exp = \
-                self.qn.update_params(prev_obs, np.array([action]),
-                    np.array([reward]), obs, np.array([done]),
-                    self.discount_factor)
-            '''
-
-            self.replay_memory.append((prev_obs, action, reward, done, obs))
-            if updates % self.update_frequency == 0:
-                # Using np arrays here, tensorflow supports batch updates
-                # in this style
-                batch = self.replay_memory.sample_batch(batch_size=32)
-                prev_obs_vector = np.array([value[0] for value in batch])
-                action_vector = np.array([value[1] for value in batch])
-                reward_vector = np.array([value[2] for value in batch])
-                done_vector = np.array([value[3] for value in batch])
-                obs_vector = np.array([value[4] for value in batch])
-
-                cur_loss, cur_pred, cur_exp = \
-                    self.qn.update_params(prev_obs_vector, action_vector,
-                                          reward_vector, obs_vector,
-                                          done_vector, self.discount_factor)
-                loss = np.average(cur_loss)
-
-
-                if t == 1.0:
-                    loss = cur_loss
-                else:
-                    loss = (cur_loss + loss * (t - 1)) / t
-                t += 1.0
-
-            updates += 1
-
-
-            if iterations % 200 == 0 and done:
-                cur_reward = self.test()
-                print(cur_reward, loss, epsilon, iterations)
-                rewards.a1ppend(cur_reward)
-
                 if len(last_20_episode_rewards) > 0:
                     training_rewards.append(sum(last_20_episode_rewards) /
                         len(last_20_episode_rewards))
@@ -393,64 +348,106 @@ class DQN_Agent():
 
                 self.qn.save_model_weights("network")
 
-                '''
-                print('training rewards:', file=sys.stderr)
-                for reward in training_rewards:
-                    print(reward, file=sys.stderr)
 
-                print('test rewards:', file=sys.stderr)
-                for reward in rewards:
-                    print(reward, file=sys.stderr)
-                '''
 
                 plt.clf()
-                training_line = plt.plot([100*i for i in
+                training_line = plt.plot([i for i in
                     range(len(training_rewards))], training_rewards, aa=True,
                     label='Training rewards')
-                test_line = plt.plot([100*i for i in range(len(rewards))],
-                    rewards, aa=True, label='Test rewards')
+                test_line = plt.plot([i*100 for i in range(len(test_rewards))],
+                    test_rewards, aa=True, label='Test rewards')
                 plt.legend()
-                if self.environment_name == 'MountainCar-v0':
-                    plt.axis([0, 100*len(rewards)+1, -250, 0])
-                elif self.environment_name == 'CartPole-v0':
-                    plt.axis([0, 100*len(rewards)+1, 0, 250])
+                plt.axis([0, len(training_rewards)+1, 0, 200])
 
-                plt.xlabel('Weight updates (training iterations)')
-                plt.ylabel('Average reward per 20 episodes')
-                plt.savefig('%s.png' % self.model)
-                plt.savefig('%s.pdf' % self.model)
+                plt.xlabel('Episodes (training iterations)')
+                plt.ylabel('Average reward per 1 episode')
+                plt.savefig('breakout.png')
+                plt.savefig('breakout.pdf')
 
 
-                print(self.test(num_iterations=100))
+            epsilon = self.epsilon_max - decay_rate * episodes
+
+            prev_obs = obs
+            policy = self.epsilon_greedy_policy(self.qn.get_qvalues(prev_obs),
+                epsilon)
+            action = self.sample_action(policy)
+
+            # Take action and train QNetwork
+            if done:
+                self.reset()
+            obs, reward, done, info = self.step(action)
+
+            cur_total_reward += reward
+
+            # We just append to our replay memory and do not train on the
+            # transition that just happened
+            '''
+            cur_loss, cur_pred, cur_exp = \
+                self.qn.update_params(prev_obs, np.array([action]),
+                    np.array([reward]), obs, np.array([done]),
+                    self.discount_factor)
+            '''
+
+            self.replay_memory.append((prev_obs, action, reward, done, obs))
+            # Using np arrays here, tensorflow supports batch updates
+            # in this style
+            batch = self.replay_memory.sample_batch(batch_size=32)
+            prev_obs_vector = np.array([value[0] for value in batch])
+            action_vector = np.array([value[1] for value in batch])
+            reward_vector = np.array([value[2] for value in batch])
+            done_vector = np.array([value[3] for value in batch])
+            obs_vector = np.array([value[4] for value in batch])
+
+            cur_loss, cur_pred, cur_exp = \
+                self.qn.update_params(prev_obs_vector, action_vector,
+                                      reward_vector, obs_vector,
+                                      done_vector, self.discount_factor)
+            loss = np.average(cur_loss)
 
 
-        return rewards
+            if t == 1.0:
+                loss = cur_loss
+            else:
+                loss = (cur_loss + loss * (t - 1)) / t
+            t += 1.0
 
-    def test(self, model_file=None, video_capture = False, num_iterations=20,
+            updates += 1
+            current_updates += 1
+            '''
+            print('training episode: %d total updates: %d current updates: %d'
+                % (episodes, updates, current_updates))
+            '''
+
+        return test_rewards
+
+    def test(self, model_file=None, video_capture=False, num_iterations=20,
         epsilon_greedy=False):
-        # Evaluate the performance of your agent over 100 episodes, by
-        # calculating cummulative rewards for the 100 episodes.
-        # Here you need to interact with the environment, irrespective of
-        # whether you are using a memory.
         if model_file is not None:
             self.qn.load_model(environment_name)
 
         if video_capture:
-            self.env = gym.wrappers.Monitor(self.env, '.', force=True)
+            self.env = gym.wrappers.Monitor(self.env, './test_videos', force=True)
+        if self.render:
+            self.env.render()
 
+
+        episodes = 0
         iterations = 0
 
         cum_reward = 0
         rewards = []
-        while iterations < num_iterations:
+        while episodes < num_iterations:
+            print('testing episode: %d' % episodes)
             done = False
             obs = self.reset()
 
             current_reward = 0
+            current_iterations = 0
 
             while not done:
                 # if self.render:
                 #     env.render()
+                #print('test episodes: %d total iterations: %d current iterations: %d' % (episodes, iterations, current_iterations))
 
                 if epsilon_greedy:
                     policy =    \
@@ -463,16 +460,17 @@ class DQN_Agent():
                 action_to_take = self.sample_action(policy)
 
                 # Take action and record reward
-                # TODO: Do we need to discount reward here?
-
                 obs, reward, done, info = self.step(action_to_take)
 
                 current_reward += reward
                 cum_reward += reward
+                current_iterations += 1
+                iterations += 1
 
             rewards.append(current_reward)
+            prinT('reward: %d' % current_reward)
 
-            iterations += 1
+            episodes += 1
 
         rewards_arr = np.array(rewards)
         print('mean: %f std: %f' % (np.mean(rewards_arr, axis=0),
@@ -490,7 +488,11 @@ class DQN_Agent():
         obs = self.reset()
         prev_obs = None
 
+        if self.render:
+            self.env.render()
+
         for i in range(self.replay_memory.burn_in):
+            print('burn in transition: %d' % i)
             # We want to initialize memory with on-policy experience from our
             # just-initialized QNetwork
 
@@ -504,9 +506,8 @@ class DQN_Agent():
 
             # Sample action from current policy
             action_to_take = self.sample_action(policy)
-            # Take action and record reward
             prev_obs = obs
-            # Do we need to discount reward here?
+            # Take action and record reward
             obs, reward, done, info = self.step(action_to_take)
             self.replay_memory.append((prev_obs, action_to_take, reward, done,
                 obs))
@@ -516,7 +517,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='Deep Q Network Argument   \
         Parser')
     parser.add_argument('--env',dest='env',type=str)
-    parser.add_argument('--render',dest='render',type=int,default=0)
+    parser.add_argument('--render',dest='render',action='store_true')
     #parser.add_argument('--train',dest='train',type=int,default=1)
     #parser.add_argument('--model-file',dest='model_file',type=str)
     #parser.add_argument('--model',dest='model',type=str, default='linear')
@@ -542,12 +543,11 @@ def main(args):
     # Setting this as the default tensorflow session.
     # keras.backend.tensorflow_backend.set_session(sess)
 
-    dqn = DQN_Agent(environment_name, render, video_capture)
-    #dqn.test(num_iterations=1, video_capture=True, model_file='network')
+    dqn = DQN_Agent(sess, environment_name, render, video_capture)
 
     eval_rewards = dqn.train()
 
-    cum_reward = dqn.test()
+    avg_test_reward = dqn.test()
     print(cum_reward)
 
 if __name__ == '__main__':
