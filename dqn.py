@@ -11,13 +11,15 @@ import random
 import matplotlib.pyplot as plt
 from collections import deque
 
+
+
 def tf_shape_to_np_shape(shape):
     return [-1 if x.value is None else x.value for x in shape]
 
 class QNetwork():
 
     def __init__(self, sess, obs_shape, num_actions, debug=False,
-        learning_rate=1e-4):
+        learning_rate=1e-4, model_file=None):
 
         self.learning_rate = learning_rate
         self.sess = sess
@@ -30,7 +32,10 @@ class QNetwork():
         self.num_actions = num_actions
 
         self.create_model()
-        self.sess.run(tf.global_variables_initializer())
+        if model_file is not None:
+            self.load_model('network')
+        else:
+            self.sess.run(tf.global_variables_initializer())
 
 
     # create_model: Initializes a tensorflow model
@@ -79,6 +84,7 @@ class QNetwork():
                 self.num_actions,
                 activation_fn = None,
             )
+            tf.summary.histogram('qvalue_logits', self.qvalue_logits)
 
             self.action = tf.argmax(input=self.qvalue_logits, axis=1)
 
@@ -93,9 +99,14 @@ class QNetwork():
 
             self.loss = tf.reduce_mean(tf.square(self.expected_ph -
                 self.prediction))
+            tf.summary.scalar('loss', self.loss)
             self.optimizer =    \
                 tf.train.AdamOptimizer(learning_rate=self.learning_rate)
             self.train_op = self.optimizer.minimize(loss=self.loss)
+
+            self.file_writer = tf.summary.FileWriter('./logs', self.sess.graph)
+            self.merged = tf.summary.merge_all()
+
 
 
     def update_params(self, prev_obs, action, reward, obs, done,
@@ -114,9 +125,11 @@ class QNetwork():
                 * np.max(q_primes, axis=1))
         }
 
-        _,loss, pred, exp = \
-            self.sess.run([self.train_op, self.loss, self.prediction,
+        summary, _,loss, pred, exp = \
+            self.sess.run([self.merged, self.train_op, self.loss, self.prediction,
                 self.expected_ph],feed_dict=feed_dict)
+        self.file_writer.add_summary(summary)
+
 
         return loss, pred, exp
 
@@ -137,7 +150,7 @@ class QNetwork():
     def load_model(self, environment_name):
         # Helper function to load an existing model.
         saver = tf.train.Saver()
-        saver.restore(self.sess, "/saved_models/%s_model.ckpt" % environment_name)
+        saver.restore(self.sess, "./%s_model.ckpt" % environment_name)
 
     def load_model_weights(self,weight_file):
         # Helper funciton to load model weights.
@@ -147,7 +160,8 @@ class QNetwork():
 # If necessary, will implement prioritized replay
 class Replay_Memory():
 
-    def __init__(self, memory_size=1000000, burn_in=50000):
+    # About 0.0003 gb per transition, probably want 50000 for ~15 gb
+    def __init__(self, memory_size=100000, burn_in=5000):
         self.memory = deque([])
         self.current_size = 0
         self.memory_size = memory_size
@@ -180,7 +194,8 @@ class Replay_Memory():
 
 class DQN_Agent():
 
-    def __init__(self, sess, environment_name, render=False, video_capture=False):
+    def __init__(self, sess, environment_name, render=False,
+        video_capture=False, model_file=None):
 
         self.environment_name = environment_name
         self.render = render
@@ -190,12 +205,12 @@ class DQN_Agent():
 
         # batch, in_height, in_width, in_channels
         self.qn = QNetwork(sess, (None, 110, 84, 4),
-            self.env.action_space.n, learning_rate=1e-4)
+            self.env.action_space.n, learning_rate=1e-4, model_file=model_file)
 
-        # Annealed linearly from 1 to 0.1 over the first million frames then
+        # Annealed linearly from 0.2 to 0.01 over the first million frames then
         # fixed afterwards
-        self.epsilon_max = 1
-        self.epsilon_min = 0.1
+        self.epsilon_max = 0.2
+        self.epsilon_min = 0.01
 
         self.discount_factor = 0.99
         self.training_iterations = 1e7  # 10,000,000
@@ -227,6 +242,9 @@ class DQN_Agent():
         gray_small_image = resize(gray_image, (110, 84))
 
         # Include last 3 frames as well, in the order earliest to latest
+
+        # This should help save on memory
+        gray_integer_small_image = gray_small_image.astype(np.uint8)
 
         obs = np.append(np.append(np.append(self.last_three_frames[0],
             self.last_three_frames[1], axis=0), self.last_three_frames[2],
@@ -278,6 +296,8 @@ class DQN_Agent():
         return policy()
 
 
+    # How about instead of taking a step and then training on a whole minibatch
+    # we run an episode, then sample and train on a minibatch?
     def train(self):
         if self.video_capture:
             self.env = gym.wrappers.Monitor(self.env, './training_videos',
@@ -312,11 +332,54 @@ class DQN_Agent():
             if self.render:
                 self.env.render()
 
+            epsilon = self.epsilon_max - decay_rate * episodes
+
+            prev_obs = obs
+            policy = self.epsilon_greedy_policy(self.qn.get_qvalues(prev_obs),
+                epsilon)
+            action = self.sample_action(policy)
+
+            # Take action and train QNetwork
+            obs, reward, done, info = self.step(action)
+
+            cur_total_reward += reward
+
+            # We just append to our replay memory and do not train on the
+            # transition that just happened
+            '''
+            cur_loss, cur_pred, cur_exp = \
+                self.qn.update_params(prev_obs, np.array([action]),
+                    np.array([reward]), obs, np.array([done]),
+                    self.discount_factor)
+            '''
+
+            self.replay_memory.append((prev_obs, action, reward, done, obs))
+
+
+            updates += 1
+            current_updates += 1
+
             if done:
-                print('training reward: %d loss: %d epsilon: %d episodes: %d' %
+                # Using np arrays here, tensorflow supports batch updates
+                # in this style
+                batch = self.replay_memory.sample_batch(batch_size=32)
+                prev_obs_vector = np.array([value[0] for value in batch])
+                action_vector = np.array([value[1] for value in batch])
+                reward_vector = np.array([value[2] for value in batch])
+                done_vector = np.array([value[3] for value in batch])
+                obs_vector = np.array([value[4] for value in batch])
+
+                # prev_obs and obs are np.uint8, we want to be tf.float32
+                cur_loss, cur_pred, cur_exp = \
+                    self.qn.update_params(prev_obs_vector.astype(np.float32), action_vector,
+                                          reward_vector, obs_vector.astype(np.float32),
+                                          done_vector, self.discount_factor)
+                loss = np.average(cur_loss)
+
+                print('training reward: %d loss: %f epsilon: %f episodes: %d' %
                     (cur_total_reward, loss, epsilon, episodes))
                 print('current updates: %d total updates %d' % (current_updates,
-                    total_updates))
+                    updates))
 
                 if episodes % 100 == 0:
                     cur_reward = self.test()
@@ -325,9 +388,9 @@ class DQN_Agent():
 
 
                 episodes += 1
+
                 obs = self.reset()
                 loss = None
-                t = 1.0
                 current_updates = 0
 
                 # last_20_episode_rewards is used for plotting training rewards
@@ -344,11 +407,9 @@ class DQN_Agent():
                     training_rewards.append(sum(last_20_episode_rewards) /
                         len(last_20_episode_rewards))
                 else:
-                        training_rewards.append(0)
+                    training_rewards.append(0)
 
                 self.qn.save_model_weights("network")
-
-
 
                 plt.clf()
                 training_line = plt.plot([i for i in
@@ -365,54 +426,6 @@ class DQN_Agent():
                 plt.savefig('breakout.pdf')
 
 
-            epsilon = self.epsilon_max - decay_rate * episodes
-
-            prev_obs = obs
-            policy = self.epsilon_greedy_policy(self.qn.get_qvalues(prev_obs),
-                epsilon)
-            action = self.sample_action(policy)
-
-            # Take action and train QNetwork
-            if done:
-                self.reset()
-            obs, reward, done, info = self.step(action)
-
-            cur_total_reward += reward
-
-            # We just append to our replay memory and do not train on the
-            # transition that just happened
-            '''
-            cur_loss, cur_pred, cur_exp = \
-                self.qn.update_params(prev_obs, np.array([action]),
-                    np.array([reward]), obs, np.array([done]),
-                    self.discount_factor)
-            '''
-
-            self.replay_memory.append((prev_obs, action, reward, done, obs))
-            # Using np arrays here, tensorflow supports batch updates
-            # in this style
-            batch = self.replay_memory.sample_batch(batch_size=32)
-            prev_obs_vector = np.array([value[0] for value in batch])
-            action_vector = np.array([value[1] for value in batch])
-            reward_vector = np.array([value[2] for value in batch])
-            done_vector = np.array([value[3] for value in batch])
-            obs_vector = np.array([value[4] for value in batch])
-
-            cur_loss, cur_pred, cur_exp = \
-                self.qn.update_params(prev_obs_vector, action_vector,
-                                      reward_vector, obs_vector,
-                                      done_vector, self.discount_factor)
-            loss = np.average(cur_loss)
-
-
-            if t == 1.0:
-                loss = cur_loss
-            else:
-                loss = (cur_loss + loss * (t - 1)) / t
-            t += 1.0
-
-            updates += 1
-            current_updates += 1
             '''
             print('training episode: %d total updates: %d current updates: %d'
                 % (episodes, updates, current_updates))
@@ -425,8 +438,10 @@ class DQN_Agent():
         if model_file is not None:
             self.qn.load_model(environment_name)
 
+        '''
         if video_capture:
             self.env = gym.wrappers.Monitor(self.env, './test_videos', force=True)
+        '''
         if self.render:
             self.env.render()
 
@@ -449,12 +464,17 @@ class DQN_Agent():
                 #     env.render()
                 #print('test episodes: %d total iterations: %d current iterations: %d' % (episodes, iterations, current_iterations))
 
+                '''
                 if epsilon_greedy:
                     policy =    \
                         self.epsilon_greedy_policy(self.qn.get_qvalues(obs),
                         0.05)
                 else:
                     policy = self.greedy_policy(self.qn.get_qvalues(obs))
+                '''
+                policy = self.epsilon_greedy_policy(self.qn.get_qvalues(obs),
+                        0.05)
+
 
                 # Sample action from current policy
                 action_to_take = self.sample_action(policy)
@@ -468,7 +488,7 @@ class DQN_Agent():
                 iterations += 1
 
             rewards.append(current_reward)
-            prinT('reward: %d' % current_reward)
+            print('reward: %d' % current_reward)
 
             episodes += 1
 
@@ -492,7 +512,8 @@ class DQN_Agent():
             self.env.render()
 
         for i in range(self.replay_memory.burn_in):
-            print('burn in transition: %d' % i)
+            if i % 100 == 0:
+                print('burn in transition: %d' % i)
             # We want to initialize memory with on-policy experience from our
             # just-initialized QNetwork
 
@@ -519,7 +540,7 @@ def parse_arguments():
     parser.add_argument('--env',dest='env',type=str)
     parser.add_argument('--render',dest='render',action='store_true')
     #parser.add_argument('--train',dest='train',type=int,default=1)
-    #parser.add_argument('--model-file',dest='model_file',type=str)
+    parser.add_argument('--model_file',dest='model_file',type=str)
     #parser.add_argument('--model',dest='model',type=str, default='linear')
     #parser.add_argument('--replay',dest='replay', action='store_true')
     parser.add_argument('--video_capture',dest='video_capture',
@@ -531,7 +552,7 @@ def main(args):
     args = parse_arguments()
     environment_name = args.env
     render = args.render
-    #model = args.model
+    model_file = args.model_file
     #replay = args.replay
     video_capture = args.video_capture
 
@@ -540,10 +561,11 @@ def main(args):
     config = tf.ConfigProto(gpu_options=gpu_ops)
     sess = tf.Session(config=config)
 
+
     # Setting this as the default tensorflow session.
     # keras.backend.tensorflow_backend.set_session(sess)
 
-    dqn = DQN_Agent(sess, environment_name, render, video_capture)
+    dqn = DQN_Agent(sess, environment_name, render, video_capture, model_file)
 
     eval_rewards = dqn.train()
 

@@ -3,3 +3,4 @@ breakout.*
 checkpoint
 network_model.*
 openaigym.*
+logs/*
