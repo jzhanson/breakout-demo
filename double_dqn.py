@@ -48,43 +48,48 @@ class QNetwork():
 
             self.action_ph = tf.placeholder(dtype=tf.uint8, shape=[None])
 
-            self.online_conv1 = tf.layers.conv2d(
-                inputs=self.state_ph,
-                filters=32,
-                kernel_size=[8,8],
-                strides=4,
-                padding="same",
-                activation=tf.nn.relu
-            )
-            self.online_conv2 = tf.layers.conv2d(
-                inputs=self.online_conv1,
-                filters=64,
-                kernel_size=[4,4],
-                strides=2,
-                padding="same",
-                activation=tf.nn.relu
-            )
-            self.online_conv3 = tf.layers.conv2d(
-                inputs=self.online_conv2,
-                filters=64,
-                kernel_size=[3,3],
-                strides=1,
-                padding="same",
-                activation=tf.nn.relu
-            )
+            self.online_conv1, self.online_conv1_w, self.online_conv2_b     \
+                = tf.layers.conv2d(
+                    inputs=self.state_ph,
+                    filters=32,
+                    kernel_size=[8,8],
+                    strides=4,
+                    padding="same",
+                    activation=tf.nn.relu
+                )
+            self.online_conv2, self.online_conv2_w, self.online_conv2_b     \
+                = tf.layers.conv2d(
+                    inputs=self.online_conv1,
+                    filters=64,
+                    kernel_size=[4,4],
+                    strides=2,
+                    padding="same",
+                    activation=tf.nn.relu
+                )
+            self.online_conv3, self.online_conv3_w, self.online_conv3_b \
+                = tf.layers.conv2d(
+                    inputs=self.online_conv2,
+                    filters=64,
+                    kernel_size=[3,3],
+                    strides=1,
+                    padding="same",
+                    activation=tf.nn.relu
+                )
 
             self.online_conv3_flat = tf.reshape(self.online_conv3, [-1,
                 np.prod(np.array(self.online_conv3.shape[1:]))])
 
-            self.online_fully_connected =   \
-                tf.contrib.layers.fully_connected(self.online_conv3_flat,
-                512, activation_fn=tf.nn.relu)
+            self.online_fully_connected, self.online_fully_connected_w, \
+                self.online_fully_connected_b = \
+                    tf.contrib.layers.fully_connected(self.online_conv3_flat,
+                    512, activation_fn=tf.nn.relu)
 
-            self.qvalue_logits = tf.contrib.layers.fully_connected(
-                self.online_fully_connected,
-                self.num_actions,
-                activation_fn = None,
-            )
+            self.qvalue_logits, self.qvalue_logits_w, self.qvalue_logits_b  \
+                = tf.contrib.layers.fully_connected(
+                    self.online_fully_connected,
+                    self.num_actions,
+                    activation_fn = None,
+                )
             tf.summary.histogram('qvalue_logits', self.qvalue_logits)
 
             self.action = tf.argmax(input=self.qvalue_logits, axis=1)
@@ -98,43 +103,48 @@ class QNetwork():
                 axis=1,
             )
 
-            self.target_conv1 = tf.layers.conv2d(
-                inputs=self.state_ph,
-                filters=32,
-                kernel_size=[8,8],
-                strides=4,
-                padding="same",
-                activation=tf.nn.relu
-            )
-            self.target_conv2 = tf.layers.conv2d(
-                inputs=self.target_conv1,
-                filters=64,
-                kernel_size=[4,4],
-                strides=2,
-                padding="same",
-                activation=tf.nn.relu
-            )
-            self.target_conv3 = tf.layers.conv2d(
-                inputs=self.target_conv2,
-                filters=64,
-                kernel_size=[3,3],
-                strides=1,
-                padding="same",
-                activation=tf.nn.relu
-            )
+            self.target_conv1, self.target_conv1_w, self.target_conv1_b \
+                = tf.layers.conv2d(
+                    inputs=self.state_ph,
+                    filters=32,
+                    kernel_size=[8,8],
+                    strides=4,
+                    padding="same",
+                    activation=tf.nn.relu
+                )
+            self.target_conv2, self.target_conv2_w, self.target_conv2_b \
+                = tf.layers.conv2d(
+                    inputs=self.target_conv1,
+                    filters=64,
+                    kernel_size=[4,4],
+                    strides=2,
+                    padding="same",
+                    activation=tf.nn.relu
+                )
+            self.target_conv3, self.target_conv3_w, self.target_conv3_b \
+                = tf.layers.conv2d(
+                    inputs=self.target_conv2,
+                    filters=64,
+                    kernel_size=[3,3],
+                    strides=1,
+                    padding="same",
+                    activation=tf.nn.relu
+                )
 
             self.target_conv3_flat = tf.reshape(self.target_conv3, [-1,
                 np.prod(np.array(self.target_conv3.shape[1:]))])
 
-            self.target_fully_connected =   \
-                tf.contrib.layers.fully_connected(self.target_conv3_flat,
-                512, activation_fn=tf.nn.relu)
+            self.target_fully_connected, self.target_fully_connected_w,     \
+                self.target_fully_connected_w =   \
+                    tf.contrib.layers.fully_connected(self.target_conv3_flat,
+                    512, activation_fn=tf.nn.relu)
 
-            self.target_qvalue_logits = tf.contrib.layers.fully_connected(
-                self.target_fully_connected,
-                self.num_actions,
-                activation_fn = None,
-            )
+            self.target_qvalue_logits, self.target_qvalue_logits_w,     \
+                self.target_qvalue_logits_b = tf.contrib.layers.fully_connected(
+                    self.target_fully_connected,
+                    self.num_actions,
+                    activation_fn = None,
+                )
 
             self.loss = tf.reduce_mean(tf.square(self.expected_ph -
                 self.prediction))
@@ -175,13 +185,18 @@ class QNetwork():
         return loss, pred, exp
 
     def sync_params(self):
-        self.target_conv1.set_weights(self.online_conv1.get_weights())
-        self.target_conv2.set_weights(self.online_conv2.get_weights())
-        self.target_conv3.set_weights(self.online_conv3.get_weights())
+        self.target_conv1_w = self.online_conv1_w
+        self.target_conv1_b = self.online_conv1_b
+        self.target_conv2_w = self.online_conv2_w
+        self.target_conv2_b = self.online_conv2_b
+        self.target_conv3_w = self.online_conv3_w
+        self.target_conv3_b = self.online_conv3_b
+        self.target_fully_connected_w = self.online_fully_connected_w
+        self.target_fully_connected_b = self.online_fully_connected_b
+        self.target_qvalue_logits_w = self.qvalue_logits_w
+        self.target_qvalue_logits_b = self.qvalue_logits_w
 
-        # conv3_flat is not really a layer
-        self.target_fully_connected.set_weights(self.online_fully_connected.get_weights())
-        self.target_qvalue_logits.set_weights(self.qvalue_logits.get_weights())
+
 
 
 
