@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-import tensorflow as tf
+from keras.models import Sequential
+from keras.layers import Dense, Activation, Flatten, Conv2D
 import numpy as np
 #import scipy
 from skimage.transform import resize
@@ -18,11 +19,11 @@ def tf_shape_to_np_shape(shape):
 
 class QNetwork():
 
-    def __init__(self, sess_config, obs_shape, num_actions, debug=False,
+    def __init__(self, sess, obs_shape, num_actions, debug=False,
         learning_rate=1e-4, model_file=None):
 
         self.learning_rate = learning_rate
-        self.sess_config = sess_config
+        self.sess = sess
 
         # By passing observation_space and num_actions, we don't have to have
         # an gym env in this class too.
@@ -34,173 +35,49 @@ class QNetwork():
         self.create_model()
         if model_file is not None:
             self.load_model(model_file)
-            saver = tf.train.Saver()
-            saver.restore(self.target_sess, "./double_model.ckpt")
-
         else:
-            self.online_sess.run(tf.global_variables_initializer())
-            self.target_sess.run(tf.global_variables_initializer())
+            self.sess.run(tf.global_variables_initializer())
 
 
     # create_model: Initializes a tensorflow model
     def create_model(self):
-        self.online_network = tf.Graph()
-        self.target_network = tf.Graph()
 
-        with self.online_network.as_default():
-            self.state_ph = tf.placeholder(dtype=tf.float32,
-                shape=self.obs_shape)
+        self.online_model = Sequential()
+        self.online_model.add(Conv2D(32, [8, 8], strides=[4, 4], padding="same", activation='relu'))
+        self.online_model.add(Conv2D(64, [4, 4], strides=[2, 2], padding="same", activation='relu'))
+        self.online_model.add(Conv2D(64, [3, 3], strides=[1, 1], padding="same", activation='relu'))
+        self.online_model.add(Flatten())
+        self.online_model.add(Dense(512, activation='relu', use_bias=True))
+        self.online_model.add(Dense(self.num_actions, activation='linear', use_bias=True))
 
-            self.expected_ph = tf.placeholder(dtype=tf.float32, shape=[None])
+        self.target_model = Sequential()
+        self.target_model.add(Conv2D(32, [8, 8], strides=[4, 4], padding="same", activation='relu'))
+        self.target_model.add(Conv2D(64, [4, 4], strides=[2, 2], padding="same", activation='relu'))
+        self.target_model.add(Conv2D(64, [3, 3], strides=[1, 1], padding="same", activation='relu'))
+        self.target_model.add(Flatten())
+        self.target_model.add(Dense(512, activation='relu', use_bias=True))
+        self.target_model.add(Dense(self.num_actions, activation='linear', use_bias=True))
 
-            self.action_ph = tf.placeholder(dtype=tf.uint8, shape=[None])
+        # Make sure the weights are the same
+        for i in range(4):
+            self.target_model[i].set_weights(self.online_model[i].get_weights)
 
-            self.online_conv1 = tf.layers.conv2d(
-                    inputs=self.state_ph,
-                    filters=32,
-                    kernel_size=[8,8],
-                    strides=4,
-                    padding="same",
-                    activation=tf.nn.relu
-            )
-            self.online_conv2 = tf.layers.conv2d(
-                    inputs=self.online_conv1,
-                    filters=64,
-                    kernel_size=[4,4],
-                    strides=2,
-                    padding="same",
-                    activation=tf.nn.relu
-            )
-            self.online_conv3 = tf.layers.conv2d(
-                    inputs=self.online_conv2,
-                    filters=64,
-                    kernel_size=[3,3],
-                    strides=1,
-                    padding="same",
-                    activation=tf.nn.relu
-            )
-
-            self.online_conv3_flat = tf.reshape(self.online_conv3, [-1,
-                np.prod(np.array(self.online_conv3.shape[1:]))])
-
-            self.online_fully_connected =   \
-                tf.contrib.layers.fully_connected(self.online_conv3_flat,
-                    512, activation_fn=tf.nn.relu)
-
-            self.qvalue_logits = tf.contrib.layers.fully_connected(
-                    self.online_fully_connected,
-                    self.num_actions,
-                    activation_fn = None,
-            )
-            tf.summary.histogram('qvalue_logits', self.qvalue_logits)
-
-            self.action = tf.argmax(input=self.qvalue_logits, axis=1)
-
-            self.prediction = tf.reduce_sum(
-                tf.multiply(
-                    self.qvalue_logits,
-                    tf.one_hot(self.action_ph, self.num_actions),
-                ),
-                axis=1,
-            )
-            self.loss = tf.reduce_mean(tf.square(self.expected_ph -
-                self.prediction))
-            tf.summary.scalar('loss', self.loss)
-            self.optimizer =    \
-                tf.train.AdamOptimizer(learning_rate=self.learning_rate)
-            self.train_op = self.optimizer.minimize(loss=self.loss)
-
-            self.online_sess = tf.Session(config=self.sess_config)
-
-            self.file_writer = tf.summary.FileWriter('./logs',
-                self.online_sess.graph)
-            self.merged = tf.summary.merge_all()
-
-
-        with self.target_network.as_default():
-
-            self.target_state_ph = tf.placeholder(dtype=tf.float32,
-                shape=self.obs_shape)
-
-            '''
-            # Don't really need these but don't want the save/restore weights to
-            # complain.
-            self.target_expected_ph = tf.placeholder(dtype=tf.float32,
-                shape=[None])
-
-            self.target_action_ph = tf.placeholder(dtype=tf.uint8, shape=[None])
-            '''
-
-
-            self.target_conv1 = tf.layers.conv2d(
-                    inputs=self.target_state_ph,
-                    filters=32,
-                    kernel_size=[8,8],
-                    strides=4,
-                    padding="same",
-                    activation=tf.nn.relu
-            )
-            self.target_conv2 = tf.layers.conv2d(
-                    inputs=self.target_conv1,
-                    filters=64,
-                    kernel_size=[4,4],
-                    strides=2,
-                    padding="same",
-                    activation=tf.nn.relu
-            )
-            self.target_conv3 = tf.layers.conv2d(
-                    inputs=self.target_conv2,
-                    filters=64,
-                    kernel_size=[3,3],
-                    strides=1,
-                    padding="same",
-                    activation=tf.nn.relu
-            )
-
-            self.target_conv3_flat = tf.reshape(self.target_conv3, [-1,
-                np.prod(np.array(self.target_conv3.shape[1:]))])
-
-            self.target_fully_connected =   \
-                tf.contrib.layers.fully_connected(self.target_conv3_flat,
-                    512, activation_fn=tf.nn.relu)
-
-            self.target_qvalue_logits = tf.contrib.layers.fully_connected(
-                    self.target_fully_connected,
-                    self.num_actions,
-                    activation_fn = None,
-            )
-            '''
-            self.target_action = tf.argmax(input=self.target_qvalue_logits, axis=1)
-
-            self.target_prediction = tf.reduce_sum(
-                tf.multiply(
-                    self.target_qvalue_logits,
-                    tf.one_hot(self.target_action_ph, self.num_actions),
-                ),
-                axis=1,
-            )
-            self.target_loss = tf.reduce_mean(tf.square(self.target_expected_ph -
-                self.target_prediction))
-            tf.summary.scalar('loss', self.target_loss)
-            self.target_optimizer =    \
-                tf.train.AdamOptimizer(learning_rate=self.learning_rate)
-            self.target_train_op = self.target_optimizer.minimize(loss=self.target_loss)
-            '''
-
-            self.target_sess = tf.Session(config=self.sess_config)
-
+        rmsprop = RMSprop(lr=self.learning_rate, rho=0.95, epsilon=None, decay=0.0)
+        self.online_model.compile(loss='mean_squared_error', optimizer=rmsprop)
+        self.target_model.compile(loss='mean_squared_error', optimizer=rmsprop)
 
 
     def update_params(self, prev_obs, action, reward, obs, done,
         discount_factor):
-        q_primes = self.get_qvalues(obs)
+        q_primes = self.online_model.predict(obs)
         max_action = np.argmax(q_primes, axis=1)
 
-
-        target_q_primes = self.get_target_qvalues(obs)
+        target_q_primes = self.target_model.predict(obs)
 
         done = np.vectorize(lambda b: 0 if b else 1)(done)
         discount_factor = done * discount_factor
+
+        self.online_model.train_on_batch(prev_obs,
 
 
         feed_dict = {
@@ -212,30 +89,39 @@ class QNetwork():
         }
 
         summary, _,loss, pred, exp = \
-            self.online_sess.run([self.merged, self.train_op, self.loss,
-                self.prediction, self.expected_ph],feed_dict=feed_dict)
+            self.sess.run([self.merged, self.train_op, self.loss, self.prediction,
+                self.expected_ph],feed_dict=feed_dict)
         self.file_writer.add_summary(summary)
 
         return loss, pred, exp
 
     def sync_params(self):
-        self.save_model()
-        saver = tf.train.Saver()
-        saver.restore(self.target_sess, "./double_model.ckpt")
+        self.target_conv1_w = self.online_conv1_w
+        self.target_conv1_b = self.online_conv1_b
+        self.target_conv2_w = self.online_conv2_w
+        self.target_conv2_b = self.online_conv2_b
+        self.target_conv3_w = self.online_conv3_w
+        self.target_conv3_b = self.online_conv3_b
+        self.target_fully_connected_w = self.online_fully_connected_w
+        self.target_fully_connected_b = self.online_fully_connected_b
+        self.target_qvalue_logits_w = self.qvalue_logits_w
+        self.target_qvalue_logits_b = self.qvalue_logits_w
+
+
 
 
 
     def get_qvalues(self, obs):
         # return's the qvalue for a given state
-        return self.online_sess.run(
+        return self.sess.run(
             self.qvalue_logits,
             feed_dict={self.state_ph:
                 obs.reshape((tf_shape_to_np_shape(self.state_ph.shape)))},)
 
     def get_target_qvalues(self, obs):
-        return self.target_sess.run(
+        return self.sess.run(
             self.target_qvalue_logits,
-            feed_dict={self.target_state_ph:
+            feed_dict={self.state_ph:
                 obs.reshape((tf_shape_to_np_shape(self.state_ph.shape)))},)
 
 
@@ -243,13 +129,13 @@ class QNetwork():
     def save_model(self):
         # Helper function to save your model / weights.
         saver = tf.train.Saver()
-        save_path = saver.save(self.online_sess, "./double_model.ckpt")
+        save_path = saver.save(self.sess, "./double_model.ckpt")
 
 
     def load_model(self):
         # Helper function to load an existing model.
         saver = tf.train.Saver()
-        saver.restore(self.online_sess, "./double_model.ckpt")
+        saver.restore(self.sess, "./double_model.ckpt")
 
 
 
@@ -291,7 +177,7 @@ class Replay_Memory():
 
 class DQN_Agent():
 
-    def __init__(self, sess_config, environment_name, render=False,
+    def __init__(self, sess, environment_name, render=False,
         video_capture=False, model_file=None):
 
         self.environment_name = environment_name
@@ -301,7 +187,7 @@ class DQN_Agent():
         self.video_capture = video_capture
 
         # batch, in_height, in_width, in_channels
-        self.qn = QNetwork(sess_config, (None, 110, 84, 4),
+        self.qn = QNetwork(sess, (None, 110, 84, 4),
             self.env.action_space.n, learning_rate=1e-4, model_file=model_file)
 
 
@@ -670,12 +556,14 @@ def main(args):
 
     # Setting the session to allow growth, so it doesn't allocate all GPU memory
     gpu_ops = tf.GPUOptions(allow_growth=True)
-    sess_config = tf.ConfigProto(gpu_options=gpu_ops)
+    config = tf.ConfigProto(gpu_options=gpu_ops)
+    sess = tf.Session(config=config)
+
 
     # Setting this as the default tensorflow session.
     # keras.backend.tensorflow_backend.set_session(sess)
 
-    dqn = DQN_Agent(sess_config, environment_name, render, video_capture,
+    dqn = DQN_Agent(sess, environment_name, render, video_capture,
         model_file)
 
     eval_rewards = dqn.train()
