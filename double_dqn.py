@@ -11,6 +11,8 @@ import random
 import matplotlib.pyplot as plt
 from collections import deque
 
+#import time
+
 
 
 def tf_shape_to_np_shape(shape):
@@ -33,7 +35,7 @@ class QNetwork():
 
         self.create_model()
         if model_file is not None:
-            self.load_model(model_file)
+            self.load_model()
         else:
             self.sess.run(tf.global_variables_initializer())
 
@@ -41,120 +43,111 @@ class QNetwork():
     # create_model: Initializes a tensorflow model
     def create_model(self):
         with self.sess:
-            self.state_ph = tf.placeholder(dtype=tf.float32,
-                shape=self.obs_shape)
+            with tf.variable_scope('online'):
+                self.state_ph = tf.placeholder(dtype=tf.float32,
+                    shape=self.obs_shape)
 
-            self.expected_ph = tf.placeholder(dtype=tf.float32, shape=[None])
+                self.expected_ph = tf.placeholder(dtype=tf.float32, shape=[None])
 
-            self.action_ph = tf.placeholder(dtype=tf.uint8, shape=[None])
+                self.action_ph = tf.placeholder(dtype=tf.uint8, shape=[None])
 
-            self.online_conv1, self.online_conv1_w, self.online_conv2_b     \
-                = tf.layers.conv2d(
-                    inputs=self.state_ph,
-                    filters=32,
-                    kernel_size=[8,8],
-                    strides=4,
-                    padding="same",
-                    activation=tf.nn.relu
+                self.online_conv1 = tf.layers.conv2d(
+                        inputs=self.state_ph,
+                        filters=32,
+                        kernel_size=[8,8],
+                        strides=4,
+                        padding="same",
+                        activation=tf.nn.relu
                 )
-            self.online_conv2, self.online_conv2_w, self.online_conv2_b     \
-                = tf.layers.conv2d(
-                    inputs=self.online_conv1,
-                    filters=64,
-                    kernel_size=[4,4],
-                    strides=2,
-                    padding="same",
-                    activation=tf.nn.relu
+                self.online_conv2 = tf.layers.conv2d(
+                        inputs=self.online_conv1,
+                        filters=64,
+                        kernel_size=[4,4],
+                        strides=2,
+                        padding="same",
+                        activation=tf.nn.relu
                 )
-            self.online_conv3, self.online_conv3_w, self.online_conv3_b \
-                = tf.layers.conv2d(
-                    inputs=self.online_conv2,
-                    filters=64,
-                    kernel_size=[3,3],
-                    strides=1,
-                    padding="same",
-                    activation=tf.nn.relu
+                self.online_conv3 = tf.layers.conv2d(
+                        inputs=self.online_conv2,
+                        filters=64,
+                        kernel_size=[3,3],
+                        strides=1,
+                        padding="same",
+                        activation=tf.nn.relu
                 )
 
-            self.online_conv3_flat = tf.reshape(self.online_conv3, [-1,
-                np.prod(np.array(self.online_conv3.shape[1:]))])
+                self.online_conv3_flat = tf.reshape(self.online_conv3, [-1,
+                    np.prod(np.array(self.online_conv3.shape[1:]))])
 
-            self.online_fully_connected, self.online_fully_connected_w, \
-                self.online_fully_connected_b = \
+                self.online_fully_connected = \
                     tf.contrib.layers.fully_connected(self.online_conv3_flat,
                     512, activation_fn=tf.nn.relu)
 
-            self.qvalue_logits, self.qvalue_logits_w, self.qvalue_logits_b  \
-                = tf.contrib.layers.fully_connected(
-                    self.online_fully_connected,
-                    self.num_actions,
-                    activation_fn = None,
+                self.qvalue_logits = tf.contrib.layers.fully_connected(
+                        self.online_fully_connected,
+                        self.num_actions,
+                        activation_fn = None,
                 )
-            tf.summary.histogram('qvalue_logits', self.qvalue_logits)
+                tf.summary.histogram('qvalue_logits', self.qvalue_logits)
 
-            self.action = tf.argmax(input=self.qvalue_logits, axis=1)
+                self.action = tf.argmax(input=self.qvalue_logits, axis=1)
 
-            # TODO: does same thing as tf.gather - can simplify?
-            self.prediction = tf.reduce_sum(
-                tf.multiply(
-                    self.qvalue_logits,
-                    tf.one_hot(self.action_ph, self.num_actions),
-                ),
-                axis=1,
-            )
-
-            self.target_conv1, self.target_conv1_w, self.target_conv1_b \
-                = tf.layers.conv2d(
-                    inputs=self.state_ph,
-                    filters=32,
-                    kernel_size=[8,8],
-                    strides=4,
-                    padding="same",
-                    activation=tf.nn.relu
+                # TODO: does same thing as tf.gather - can simplify?
+                self.prediction = tf.reduce_sum(
+                    tf.multiply(
+                        self.qvalue_logits,
+                        tf.one_hot(self.action_ph, self.num_actions),
+                    ),
+                    axis=1,
                 )
-            self.target_conv2, self.target_conv2_w, self.target_conv2_b \
-                = tf.layers.conv2d(
-                    inputs=self.target_conv1,
-                    filters=64,
-                    kernel_size=[4,4],
-                    strides=2,
-                    padding="same",
-                    activation=tf.nn.relu
+                self.loss = tf.reduce_mean(tf.square(self.expected_ph -
+                self.prediction))
+                tf.summary.scalar('loss', self.loss)
+                self.optimizer =    \
+                tf.train.AdamOptimizer(learning_rate=self.learning_rate)
+                self.train_op = self.optimizer.minimize(loss=self.loss)
+
+                self.file_writer = tf.summary.FileWriter('./logs', self.sess.graph)
+                self.merged = tf.summary.merge_all()
+
+            with tf.variable_scope('target'):
+                self.target_conv1 = tf.layers.conv2d(
+                        inputs=self.state_ph,
+                        filters=32,
+                        kernel_size=[8,8],
+                        strides=4,
+                        padding="same",
+                        activation=tf.nn.relu
                 )
-            self.target_conv3, self.target_conv3_w, self.target_conv3_b \
-                = tf.layers.conv2d(
-                    inputs=self.target_conv2,
-                    filters=64,
-                    kernel_size=[3,3],
-                    strides=1,
-                    padding="same",
-                    activation=tf.nn.relu
+                self.target_conv2 = tf.layers.conv2d(
+                        inputs=self.target_conv1,
+                        filters=64,
+                        kernel_size=[4,4],
+                        strides=2,
+                        padding="same",
+                        activation=tf.nn.relu
+                )
+                self.target_conv3 = tf.layers.conv2d(
+                        inputs=self.target_conv2,
+                        filters=64,
+                        kernel_size=[3,3],
+                        strides=1,
+                        padding="same",
+                        activation=tf.nn.relu
                 )
 
-            self.target_conv3_flat = tf.reshape(self.target_conv3, [-1,
-                np.prod(np.array(self.target_conv3.shape[1:]))])
+                self.target_conv3_flat = tf.reshape(self.target_conv3, [-1,
+                    np.prod(np.array(self.target_conv3.shape[1:]))])
 
-            self.target_fully_connected, self.target_fully_connected_w,     \
-                self.target_fully_connected_w =   \
+                self.target_fully_connected =   \
                     tf.contrib.layers.fully_connected(self.target_conv3_flat,
                     512, activation_fn=tf.nn.relu)
 
-            self.target_qvalue_logits, self.target_qvalue_logits_w,     \
-                self.target_qvalue_logits_b = tf.contrib.layers.fully_connected(
+                self.target_qvalue_logits = tf.contrib.layers.fully_connected(
                     self.target_fully_connected,
                     self.num_actions,
                     activation_fn = None,
                 )
-
-            self.loss = tf.reduce_mean(tf.square(self.expected_ph -
-                self.prediction))
-            tf.summary.scalar('loss', self.loss)
-            self.optimizer =    \
-                tf.train.AdamOptimizer(learning_rate=self.learning_rate)
-            self.train_op = self.optimizer.minimize(loss=self.loss)
-
-            self.file_writer = tf.summary.FileWriter('./logs', self.sess.graph)
-            self.merged = tf.summary.merge_all()
 
 
     def update_params(self, prev_obs, action, reward, obs, done,
@@ -168,13 +161,15 @@ class QNetwork():
         done = np.vectorize(lambda b: 0 if b else 1)(done)
         discount_factor = done * discount_factor
 
+        targets = np.array([target_q_primes[i][max_action[i]] for i in
+            range(len(target_q_primes))])
 
         feed_dict = {
             self.state_ph: #state_ph is the placeholder value for the state
                 prev_obs.reshape((tf_shape_to_np_shape(self.state_ph.shape))),
             self.action_ph: action,
             self.expected_ph: reward + (discount_factor
-                * target_q_primes[max_action])
+                * targets)
         }
 
         summary, _,loss, pred, exp = \
@@ -185,18 +180,17 @@ class QNetwork():
         return loss, pred, exp
 
     def sync_params(self):
-        self.target_conv1_w = self.online_conv1_w
-        self.target_conv1_b = self.online_conv1_b
-        self.target_conv2_w = self.online_conv2_w
-        self.target_conv2_b = self.online_conv2_b
-        self.target_conv3_w = self.online_conv3_w
-        self.target_conv3_b = self.online_conv3_b
-        self.target_fully_connected_w = self.online_fully_connected_w
-        self.target_fully_connected_b = self.online_fully_connected_b
-        self.target_qvalue_logits_w = self.qvalue_logits_w
-        self.target_qvalue_logits_b = self.qvalue_logits_w
+        print('syncing params')
+        online_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, 'online')
+        target_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, 'target')
 
-
+        for i in range(len(online_vars)):
+            target_vars[i].assign(online_vars[i]).eval(session=self.sess)
+            '''
+            time.sleep(2)
+            print(online_vars[i])
+            print(target_vars[i])
+            '''
 
 
 
@@ -214,15 +208,16 @@ class QNetwork():
                 obs.reshape((tf_shape_to_np_shape(self.state_ph.shape)))},)
 
 
-
     def save_model(self):
         # Helper function to save your model / weights.
+        print('saving model')
         saver = tf.train.Saver()
         save_path = saver.save(self.sess, "./double_model.ckpt")
 
 
     def load_model(self):
         # Helper function to load an existing model.
+        print('restoring model')
         saver = tf.train.Saver()
         saver.restore(self.sess, "./double_model.ckpt")
 
@@ -267,13 +262,18 @@ class Replay_Memory():
 class DQN_Agent():
 
     def __init__(self, sess, environment_name, render=False,
-        video_capture=False, model_file=None):
+        video_capture=False, model_file=None, elapsed_episodes=None,
+        elapsed_updates=None):
 
         self.environment_name = environment_name
         self.render = render
         self.env = gym.make(self.environment_name)
 
         self.video_capture = video_capture
+
+        self.elapsed_episodes = elapsed_episodes
+        self.elapsed_updates = elapsed_updates
+
 
         # batch, in_height, in_width, in_channels
         self.qn = QNetwork(sess, (None, 110, 84, 4),
@@ -380,8 +380,13 @@ class DQN_Agent():
                 force=True, video_callable=lambda episodes: episodes % 10
                 == 0)
 
-        episodes = 0
-        updates = 0
+        if self.elapsed_episodes is not None and self.elapsed_updates is not  \
+            None:
+            episodes = self.elapsed_episodes
+            updates = self.elapsed_updates
+        else:
+            episodes = 0
+            updates = 0
 
         epsilon = self.epsilon_max
         decay_rate = (self.epsilon_max - self.epsilon_min)  \
@@ -460,49 +465,20 @@ class DQN_Agent():
                                           done_vector, self.discount_factor)
                 loss = np.average(cur_loss)
 
-                print('training reward: %d loss: %f epsilon: %f episodes: %d' %
-                    (cur_total_reward, loss, epsilon, episodes))
-                print('current updates: %d total updates %d' % (current_updates,
-                    updates))
-
-                plt.clf()
-                training_line = plt.plot([i for i in
-                    range(len(training_rewards))], training_rewards, aa=True,
-                    label='Training rewards')
-                test_line = plt.plot([i*100 for i in range(len(test_rewards))],
-                    test_rewards, aa=True, label='Test rewards')
-                plt.legend()
-                plt.axis([0, len(training_rewards)+1, 0, 200])
-
-                plt.xlabel('Episodes (training iterations)')
-                plt.ylabel('Average reward per 1 episode')
-                plt.savefig('breakout.png')
-                plt.savefig('breakout.pdf')
-
-                self.qn.save_model()
-
 
             if done:
                 # Should be 1M per evaluation, and keeping the best policy
-                if episodes % 100 == 0:
+                if episodes % 10 == 0:
                     cur_reward = self.test()
                     print('test rewards: %d' % cur_reward)
                     test_rewards.append(cur_reward)
-
-                episodes += 1
-
-                obs = self.reset()
-                loss = None
-                current_updates = 0
 
                 # last_20_episode_rewards is used for plotting training rewards
                 if len(last_20_episode_rewards) == 20:
                     last_20_episode_rewards.popleft()
                     last_20_episode_rewards.append(cur_total_reward)
-                    cur_total_reward = 0
                 else:
                     last_20_episode_rewards.append(cur_total_reward)
-                    cur_total_reward = 0
 
 
                 if len(last_20_episode_rewards) > 0:
@@ -510,6 +486,37 @@ class DQN_Agent():
                         len(last_20_episode_rewards))
                 else:
                     training_rewards.append(0)
+
+
+                episodes += 1
+
+                print('training reward: %d loss: %f epsilon: %f episodes: %d' %
+                    (cur_total_reward, loss, epsilon, episodes))
+                print('current updates: %d total updates %d' % (current_updates,
+                    updates))
+
+
+                obs = self.reset()
+                loss = None
+                current_updates = 0
+                cur_total_reward = 0
+
+                plt.clf()
+                training_line = plt.plot([i for i in
+                    range(len(training_rewards))], training_rewards, aa=True,
+                    label='Training rewards')
+                test_line = plt.plot([i*10 for i in range(len(test_rewards))],
+                    test_rewards, aa=True, label='Test rewards')
+                plt.legend()
+                plt.axis([0, len(training_rewards)+1, 0, 20])
+
+                plt.xlabel('Episodes (training iterations)')
+                plt.ylabel('Average reward per 1 episode')
+                plt.savefig('breakout.png')
+                plt.savefig('breakout.pdf')
+
+                if episodes % 10 == 0:
+                    self.qn.save_model()
 
 
             '''
@@ -524,12 +531,8 @@ class DQN_Agent():
         if model_file is not None:
             self.qn.load_model()
 
-        '''
         if video_capture:
             self.env = gym.wrappers.Monitor(self.env, './test_videos', force=True)
-        '''
-        if self.render:
-            self.env.render()
 
 
         episodes = 0
@@ -546,8 +549,8 @@ class DQN_Agent():
             current_iterations = 0
 
             while not done:
-                # if self.render:
-                #     env.render()
+                if self.render:
+                    env.render()
                 #print('test episodes: %d total iterations: %d current iterations: %d' % (episodes, iterations, current_iterations))
 
                 '''
@@ -632,6 +635,8 @@ def parse_arguments():
     #parser.add_argument('--replay',dest='replay', action='store_true')
     parser.add_argument('--video_capture',dest='video_capture',
         action='store_true')
+    parser.add_argument('--episodes',dest='elapsed_episodes',type=int,default=0)
+    parser.add_argument('--updates', dest='elapsed_updates',type=int,default=0)
     return parser.parse_args()
 
 def main(args):
@@ -643,6 +648,9 @@ def main(args):
     #replay = args.replay
     video_capture = args.video_capture
 
+    elapsed_episodes = args.elapsed_episodes
+    elapsed_updates = args.elapsed_updates
+
     # Setting the session to allow growth, so it doesn't allocate all GPU memory
     gpu_ops = tf.GPUOptions(allow_growth=True)
     config = tf.ConfigProto(gpu_options=gpu_ops)
@@ -653,7 +661,7 @@ def main(args):
     # keras.backend.tensorflow_backend.set_session(sess)
 
     dqn = DQN_Agent(sess, environment_name, render, video_capture,
-        model_file)
+        model_file, elapsed_episodes, elapsed_updates)
 
     eval_rewards = dqn.train()
 
