@@ -8,7 +8,7 @@ import sys
 import copy
 import argparse
 import random
-import matplotlib.pyplot as plt
+#import matplotlib.pyplot as plt
 from collections import deque
 
 #import time
@@ -101,10 +101,11 @@ class QNetwork():
                     axis=1,
                 )
                 self.loss = tf.reduce_mean(tf.square(self.expected_ph -
-                self.prediction))
+                    self.prediction))
                 tf.summary.scalar('loss', self.loss)
                 self.optimizer =    \
-                tf.train.AdamOptimizer(learning_rate=self.learning_rate)
+                    tf.train.RMSPropOptimizer(learning_rate=self.learning_rate,
+                        momentum=0.95)
                 self.train_op = self.optimizer.minimize(loss=self.loss)
 
                 self.file_writer = tf.summary.FileWriter('./logs', self.sess.graph)
@@ -153,26 +154,41 @@ class QNetwork():
     def update_params(self, prev_obs, action, reward, obs, done,
         discount_factor):
         q_primes = self.get_qvalues(obs)
+        # TODO : max_action are all the same?
         max_action = np.argmax(q_primes, axis=1)
-
 
         target_q_primes = self.get_target_qvalues(obs)
 
         done = np.vectorize(lambda b: 0 if b else 1)(done)
         discount_factor = done * discount_factor
 
-        targets = np.array([target_q_primes[i][max_action[i]] for i in
-            range(len(target_q_primes))])
+        # Let's make targets an array of "q-value"-hots corresponding to the
+        # action.
+
+        one_hot_max_actions = np.zeros((len(target_q_primes), self.num_actions))
+        one_hot_max_actions[np.arange(len(max_action)), max_action] = 1
+
+
+        rewards_one_hot = np.zeros((len(reward), self.num_actions))
+        rewards_one_hot[np.arange(len(max_action)), max_action] = 1
+        rewards_q_hot = rewards_one_hot*(np.array(reward))[:,np.newaxis]
+
+
+        # np.dot gives scalars back, np.multiply gives vectors back
+        targets = np.multiply(target_q_primes, one_hot_max_actions)
 
         feed_dict = {
             self.state_ph: #state_ph is the placeholder value for the state
                 prev_obs.reshape((tf_shape_to_np_shape(self.state_ph.shape))),
             self.action_ph: action,
-            self.expected_ph: reward + (discount_factor
-                * targets)
+            # Reshaping with slices so discount_factor which is an array of
+            # scalars is element-wise multiplied with targets, which is an array
+            # of vectors.
+            self.expected_ph: rewards_q_hot +
+                targets*discount_factor[:,np.newaxis]
         }
 
-        summary, _,loss, pred, exp = \
+        summary, _, loss, pred, exp = \
             self.sess.run([self.merged, self.train_op, self.loss, self.prediction,
                 self.expected_ph],feed_dict=feed_dict)
         self.file_writer.add_summary(summary)
@@ -228,6 +244,7 @@ class QNetwork():
 class Replay_Memory():
 
     # About 0.0003 gb per transition, probably want 50000 for ~15 gb
+    # Can probably safely run 300000 for 11.95 GB of memory
     def __init__(self, memory_size=100000, burn_in=5000):
         self.memory = deque([])
         self.current_size = 0
@@ -277,7 +294,7 @@ class DQN_Agent():
 
         # batch, in_height, in_width, in_channels
         self.qn = QNetwork(sess, (None, 110, 84, 4),
-            self.env.action_space.n, learning_rate=1e-4, model_file=model_file)
+            self.env.action_space.n, learning_rate=25e-5, model_file=model_file)
 
 
         # Annealed linearly from 0.2 to 0.01 over the first million frames then
@@ -469,6 +486,9 @@ class DQN_Agent():
             if done:
                 # Should be 1M per evaluation, and keeping the best policy
                 if episodes % 10 == 0:
+                    self.qn.save_model()
+                # Spend less time testing and more time training
+                if episodes % 100 == 0:
                     cur_reward = self.test()
                     print('test rewards: %d' % cur_reward)
                     test_rewards.append(cur_reward)
@@ -501,6 +521,7 @@ class DQN_Agent():
                 current_updates = 0
                 cur_total_reward = 0
 
+                '''
                 plt.clf()
                 training_line = plt.plot([i for i in
                     range(len(training_rewards))], training_rewards, aa=True,
@@ -514,9 +535,7 @@ class DQN_Agent():
                 plt.ylabel('Average reward per 1 episode')
                 plt.savefig('breakout.png')
                 plt.savefig('breakout.pdf')
-
-                if episodes % 10 == 0:
-                    self.qn.save_model()
+                '''
 
 
             '''
