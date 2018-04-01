@@ -168,15 +168,15 @@ class QNetwork():
         one_hot_max_actions = np.zeros((len(target_q_primes), self.num_actions))
         one_hot_max_actions[np.arange(len(max_action)), max_action] = 1
 
-
+        '''
         rewards_one_hot = np.zeros((len(reward), self.num_actions))
         rewards_one_hot[np.arange(len(max_action)), max_action] = 1
         rewards_q_hot = rewards_one_hot*(np.array(reward))[:,np.newaxis]
-
+        '''
 
         # np.dot gives scalars back, np.multiply gives vectors back
-        targets = np.multiply(target_q_primes, one_hot_max_actions)
-
+        targets = np.array([np.dot(target_q_primes[i], one_hot_max_actions[i])
+            for i in range(len(target_q_primes))])
         feed_dict = {
             self.state_ph: #state_ph is the placeholder value for the state
                 prev_obs.reshape((tf_shape_to_np_shape(self.state_ph.shape))),
@@ -184,8 +184,7 @@ class QNetwork():
             # Reshaping with slices so discount_factor which is an array of
             # scalars is element-wise multiplied with targets, which is an array
             # of vectors.
-            self.expected_ph: rewards_q_hot +
-                targets*discount_factor[:,np.newaxis]
+            self.expected_ph: reward + discount_factor * targets
         }
 
         summary, _, loss, pred, exp = \
@@ -243,9 +242,8 @@ class QNetwork():
 # If necessary, will implement prioritized replay
 class Replay_Memory():
 
-    # About 0.0003 gb per transition, probably want 50000 for ~15 gb
-    # Can probably safely run 300000 for 11.95 GB of memory
-    def __init__(self, memory_size=100000, burn_in=5000):
+    # About 0.0003 gb per transition
+    def __init__(self, memory_size=1000000, burn_in=50000):
         self.memory = deque([])
         self.current_size = 0
         self.memory_size = memory_size
@@ -628,8 +626,6 @@ class DQN_Agent():
             if done:
                 obs = self.reset()
 
-            # Should we use an epsilon-greedy policy?
-            #policy = self.epsilon_greedy_policy(self.qn.get_qvalues(obs), 0.05)
             policy = self.epsilon_greedy_policy(self.qn.get_qvalues(obs),
                 self.epsilon_max)
 
