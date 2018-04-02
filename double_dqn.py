@@ -1,14 +1,18 @@
 #!/usr/bin/env python
 import tensorflow as tf
 import numpy as np
-#import scipy
 from skimage.transform import resize
 import gym
 import sys
 import copy
 import argparse
 import random
-#import matplotlib.pyplot as plt
+'''
+# Next two lines are for generating plots on servers
+import matplotlib
+matplotlib.use('Agg')
+'''
+import matplotlib.pyplot as plt
 from collections import deque
 
 #import time
@@ -195,7 +199,6 @@ class QNetwork():
         return loss, pred, exp
 
     def sync_params(self):
-        print('syncing params')
         online_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, 'online')
         target_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, 'target')
 
@@ -206,8 +209,6 @@ class QNetwork():
             print(online_vars[i])
             print(target_vars[i])
             '''
-
-
 
     def get_qvalues(self, obs):
         # return's the qvalue for a given state
@@ -235,7 +236,6 @@ class QNetwork():
         print('restoring model')
         saver = tf.train.Saver()
         saver.restore(self.sess, "./double_model.ckpt")
-
 
 
 
@@ -406,7 +406,6 @@ class DQN_Agent():
         epsilon = self.epsilon_max
         decay_rate = (self.epsilon_max - self.epsilon_min)  \
             / self.decay_iterations
-        avg_total_reward = 0
 
         done = False
         prev_obs = None
@@ -423,6 +422,9 @@ class DQN_Agent():
         last_20_episode_rewards = deque([])
         cur_total_reward = 0
 
+        prev_max_reward = 0
+        best_so_far = 0
+
         while updates < self.training_iterations:
 
             if self.render:
@@ -430,6 +432,7 @@ class DQN_Agent():
 
             # Copy parameters to target network
             if updates % self.tau == 0:
+                print('syncing params, updates: %d' % updates)
                 self.qn.sync_params()
 
             if updates <= self.decay_iterations:
@@ -480,15 +483,38 @@ class DQN_Agent():
                                           done_vector, self.discount_factor)
                 loss = np.average(cur_loss)
 
+            # Every 1M iterations, evaluate policy and if it's better than the
+            # last one, print.
+            if updates % 1e6 == 0:
+                cur_reward = self.test()
+                print('%d EVALUATION REWARD: %d' % (updates // 1e6, cur_reward))
+                saver = tf.train.Saver()
+                save_path = saver.save(self.sess, "./%d_model.ckpt" %
+                    updates//1e6)
+                if cur_reward > prev_max_reward:
+                    prev_max_reward = cur_reward
+                    best_so_far = updates//1e6
+
 
             if done:
-                # Should be 1M per evaluation, and keeping the best policy
-                if episodes % 10 == 0:
-                    self.qn.save_model()
                 # Spend less time testing and more time training
                 if episodes % 100 == 0:
+                    self.qn.save_model()
+                    if len(last_20_episode_rewards) == 0:
+                        avg_reward = 0
+                    else:
+                        avg_reward = sum(last_20_episode_rewards) / \
+                        len(last_20_episode_rewards)
+
+                    print('average training reward, 20 episodes: %f' %
+                        avg_reward)
+                    print('training reward: %d loss: %f epsilon: %f' %
+                        (cur_total_reward, loss, epsilon))
+                    print('episodes: %d current updates: %d total updates %d' %
+                        (episodes, current_updates, updates))
+
                     cur_reward = self.test()
-                    print('test rewards: %d' % cur_reward)
+                    #print('test rewards: %d' % cur_reward)
                     test_rewards.append(cur_reward)
 
                 # last_20_episode_rewards is used for plotting training rewards
@@ -499,47 +525,46 @@ class DQN_Agent():
                     last_20_episode_rewards.append(cur_total_reward)
 
 
-                if len(last_20_episode_rewards) > 0:
+                if len(last_20_episode_rewards) > 0 and episodes % 20 == 0:
                     training_rewards.append(sum(last_20_episode_rewards) /
                         len(last_20_episode_rewards))
-                else:
-                    training_rewards.append(0)
+
+                    plt.clf()
+                    training_line = plt.plot([i*20 for i in
+                        range(len(training_rewards))], training_rewards, aa=True,
+                        label='Training rewards')
+                    test_line = plt.plot([i*100 for i in range(len(test_rewards))],
+                        test_rewards, aa=True, label='Test rewards')
+                    plt.legend()
+                    plt.axis([0, (len(training_rewards)+1)*20, 0, 50])
+
+                    plt.xlabel('Episodes (training iterations)')
+                    plt.ylabel('Average reward per episode over 20 episodes')
+                    plt.savefig('small_plot.png')
+                    plt.savefig('small_plot.pdf')
+
+                    plt.clf()
+                    training_line = plt.plot([i*20 for i in
+                        range(len(training_rewards))], training_rewards, aa=True,
+                        label='Training rewards')
+                    test_line = plt.plot([i*100 for i in range(len(test_rewards))],
+                        test_rewards, aa=True, label='Test rewards')
+                    plt.legend()
+                    plt.axis([0, (len(training_rewards)+1)*20, 0, 200])
+
+                    plt.xlabel('Episodes (training iterations)')
+                    plt.ylabel('Average reward per episode over 20 episodes')
+                    plt.savefig('big_plot.png')
+                    plt.savefig('big_plot.pdf')
 
 
                 episodes += 1
-
-                print('training reward: %d loss: %f epsilon: %f episodes: %d' %
-                    (cur_total_reward, loss, epsilon, episodes))
-                print('current updates: %d total updates %d' % (current_updates,
-                    updates))
-
 
                 obs = self.reset()
                 loss = None
                 current_updates = 0
                 cur_total_reward = 0
 
-                '''
-                plt.clf()
-                training_line = plt.plot([i for i in
-                    range(len(training_rewards))], training_rewards, aa=True,
-                    label='Training rewards')
-                test_line = plt.plot([i*10 for i in range(len(test_rewards))],
-                    test_rewards, aa=True, label='Test rewards')
-                plt.legend()
-                plt.axis([0, len(training_rewards)+1, 0, 20])
-
-                plt.xlabel('Episodes (training iterations)')
-                plt.ylabel('Average reward per 1 episode')
-                plt.savefig('breakout.png')
-                plt.savefig('breakout.pdf')
-                '''
-
-
-            '''
-            print('training episode: %d total updates: %d current updates: %d'
-                % (episodes, updates, current_updates))
-            '''
 
         return test_rewards
 
@@ -558,7 +583,7 @@ class DQN_Agent():
         cum_reward = 0
         rewards = []
         while episodes < num_iterations:
-            print('testing episode: %d' % episodes)
+            #print('testing episode: %d' % episodes)
             done = False
             obs = self.reset()
 
@@ -568,19 +593,9 @@ class DQN_Agent():
             while not done:
                 if self.render:
                     env.render()
-                #print('test episodes: %d total iterations: %d current iterations: %d' % (episodes, iterations, current_iterations))
 
-                '''
-                if epsilon_greedy:
-                    policy =    \
-                        self.epsilon_greedy_policy(self.qn.get_qvalues(obs),
-                        0.05)
-                else:
-                    policy = self.greedy_policy(self.qn.get_qvalues(obs))
-                '''
                 policy = self.epsilon_greedy_policy(self.qn.get_qvalues(obs),
                         0.05)
-
 
                 # Sample action from current policy
                 action_to_take = self.sample_action(policy)
@@ -594,12 +609,12 @@ class DQN_Agent():
                 iterations += 1
 
             rewards.append(current_reward)
-            print('reward: %d' % current_reward)
+            #print('reward: %d' % current_reward)
 
             episodes += 1
 
         rewards_arr = np.array(rewards)
-        print('mean: %f std: %f' % (np.mean(rewards_arr, axis=0),
+        print('test rewards mean: %f std: %f' % (np.mean(rewards_arr, axis=0),
             np.std(rewards_arr, axis=0)))
 
         return cum_reward / num_iterations
@@ -618,8 +633,10 @@ class DQN_Agent():
             self.env.render()
 
         for i in range(self.replay_memory.burn_in):
+            '''
             if i % 100 == 0:
                 print('burn in transition: %d' % i)
+            '''
             # We want to initialize memory with on-policy experience from our
             # just-initialized QNetwork
 
