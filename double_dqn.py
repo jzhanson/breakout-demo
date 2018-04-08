@@ -2,8 +2,10 @@
 import tensorflow as tf
 import numpy as np
 from skimage.transform import resize
-import gym
 import sys
+# For getting the gym pip3 installation in the conda python
+#sys.path.append('/usr/local/lib/python3.5/dist-packages')
+import gym
 import copy
 import argparse
 import random
@@ -104,12 +106,12 @@ class QNetwork():
                     ),
                     axis=1,
                 )
-                self.loss = tf.reduce_mean(tf.square(self.expected_ph -
+                # Supposedly reduce_max works better than reduce_mean
+                self.loss = tf.reduce_max(tf.square(self.expected_ph -
                     self.prediction))
                 tf.summary.scalar('loss', self.loss)
                 self.optimizer =    \
-                    tf.train.RMSPropOptimizer(learning_rate=self.learning_rate,
-                        momentum=0.95)
+                    tf.train.AdamOptimizer(learning_rate=self.learning_rate)
                 self.train_op = self.optimizer.minimize(loss=self.loss)
 
                 self.file_writer = tf.summary.FileWriter('./logs', self.sess.graph)
@@ -497,6 +499,13 @@ class DQN_Agent():
 
 
             if done:
+                if episodes % 10 == 0:
+                    print('training reward: %d loss: %f epsilon: %f' %
+                            (cur_total_reward, loss, epsilon))
+                    print('episodes: %d current updates: %d total updates %d' %
+                            (episodes, current_updates, updates))
+                    print('replay size: %d' % self.replay_memory.current_size)
+
                 # Spend less time testing and more time training
                 if episodes % 100 == 0:
                     self.qn.save_model()
@@ -508,10 +517,6 @@ class DQN_Agent():
 
                     print('average training reward, 20 episodes: %f' %
                         avg_reward)
-                    print('training reward: %d loss: %f epsilon: %f' %
-                        (cur_total_reward, loss, epsilon))
-                    print('episodes: %d current updates: %d total updates %d' %
-                        (episodes, current_updates, updates))
 
                     cur_reward = self.test()
                     #print('test rewards: %d' % cur_reward)
