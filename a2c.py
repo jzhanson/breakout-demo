@@ -26,6 +26,15 @@ env = gym.make('BreakoutNoFrameskip-v4')
 env = gym.wrappers.Monitor(env, './videos_a2c', force=True,
         video_callable=lambda episode_id: episode_id%100==0)
 
+# Copied from https://github.com/MG2033/A2C/blob/master/layers.py
+def openai_entropy(logits):
+    # Entropy proposed by OpenAI in their A2C baseline
+    a0 = logits - tf.reduce_max(logits, 1, keep_dims=True)
+    ea0 = tf.exp(a0)
+    z0 = tf.reduce_sum(ea0, 1, keep_dims=True)
+    p0 = ea0 / z0
+    return tf.reduce_sum(p0 * (tf.log(z0) - a0), 1)
+
 class A2C:
     # Initialize model, variables
     def __init__(self, lr, gamma, n):
@@ -77,7 +86,8 @@ class A2C:
         # the actor don't go through the critic
         self.advantage_tensor = tf.placeholder(tf.float32, shape=[None])
 
-        #kernel_initializer=tf.initializers.orthogonal()
+        self.global_step = tf.Variable(0, trainable=False)
+
 
         with tf.variable_scope("policy"):
             conv1 = tf.layers.conv2d(
@@ -126,10 +136,10 @@ class A2C:
             )
 
             # Add a little noise to encourage exploration!
-            #
             # self.actor_output_three = tf.nn.softmax(self.actor_policy_logits - tf.log(-tf.log(noise)))
+            # self.actor_output_tesnor = tf.nn.softmax(self.actor_policy_logits + noise)
             noise = tf.random_uniform(tf.shape(self.actor_policy_logits))
-            self.actor_output_tensor = tf.nn.softmax(self.actor_policy_logits + noise)
+            self.actor_output_tensor = tf.nn.softmax(self.actor_policy_logits - tf.log(-tf.log(noise)), 1)
 
 
             self.critic_output_tensor = tf.contrib.layers.fully_connected(
@@ -139,102 +149,149 @@ class A2C:
                     weights_initializer=tf.initializers.orthogonal()
             )
 
-
-
-        neg_action_probabilities = tf.nn.sparse_softmax_cross_entropy_with_logits(
+        neg_log_action_probabilities = tf.nn.sparse_softmax_cross_entropy_with_logits(
             logits=self.actor_policy_logits,
             labels=self.A_tensor
         )
 
         # sparse_softmax_cross_entropy is already negative, so don't need - here
-        self.actor_loss = tf.reduce_mean(self.advantage_tensor * neg_action_probabilities)
-        self.critic_loss = tf.reduce_mean(tf.square(self.R_tensor - self.critic_output_tensor))
-        self.loss = self.actor_loss + 0.5 * self.critic_loss
+        # Can change reduce_mean to reduce_sum??
+        self.actor_loss = tf.reduce_mean(self.advantage_tensor *    \
+            neg_log_action_probabilities)
+        self.critic_loss = tf.reduce_mean(tf.square(self.R_tensor -     \
+            tf.squeeze(self.critic_output_tensor)) / 2)
+        # Maybe this is the missing ingredient?
+        self.entropy = tf.reduce_mean(openai_entropy(self.actor_policy_logits))
+        self.loss = self.actor_loss + 0.5 * self.critic_loss - 0.01 * self.entropy
 
         with tf.variable_scope("policy"):
             params = tf.trainable_variables()
         grads = tf.gradients(self.loss, params)
         grads, grad_norm = tf.clip_by_global_norm(grads, 0.5)
         grads = list(zip(grads, params))
-        self.train_both = tf.train.RMSPropOptimizer(learning_rate=self.lr, decay=0.99, epsilon=1e-5)
+
+        '''
+        learning_rate = tf.train.exponential_decay(self.lr, self.global_step,
+                                                    100000, 0.96, staircase=True)
+
+        self.train_both = tf.train.RMSPropOptimizer(learning_rate=learning_rate,
+            decay=0.99, epsilon=1e-5)
+        self.train_both = self.train_both.apply_gradients(grads,
+            global_step=self.global_step)
+        '''
+        self.train_both = tf.train.RMSPropOptimizer(self.lr,
+            decay=0.99, epsilon=1e-5)
         self.train_both = self.train_both.apply_gradients(grads)
+
 
         self.saver = tf.train.Saver(max_to_keep=5)
         sess.run(tf.global_variables_initializer())
 
-    def generate_episode(self, render=True):
-        # Generates an episode by executing the current policy in the given env.
-        # Returns:
-        # - a list of states, indexed by time step
-        # - a list of actions, indexed by time step
-        # - a list of rewards, indexed by time step
-        states = []
-        actions = []
-        rewards = []
 
+    # Performs one episode of training in iterations of n steps each
+    def train(self, render=True):
         obs = self.preprocess(env.reset())
         if render:
             env.render()
         done = False
+        cur_steps = 0
+        total_steps = 0
+        total_reward = 0
+        total_actor_loss = 0
+        total_critic_loss = 0
+        iterations = 0
 
         while not done:
-            if render:
-                env.render()
-            states.append(obs)
-            # Predict takes a np array of observations as the batch
-            probs = sess.run(
-                self.actor_output_tensor,
-                feed_dict={
-                    self.input_tensor: np.array([obs])  # A dirty shape hack
-                },
+            states = []
+            actions = []
+            rewards = []
+            dones = []
+
+
+            while cur_steps < self.n and not done:
+                if render:
+                    env.render()
+                states.append(obs)
+                # Predict takes a np array of observations as the batch
+                probs = sess.run(
+                    self.actor_output_tensor,
+                    feed_dict={
+                        self.input_tensor: np.array([obs])  # A dirty shape hack
+                    },
+                )
+
+                action = np.argmax(probs)
+                '''
+                action = np.random.choice(env.action_space.n,
+                    p=np.ndarray.flatten(probs))
+                '''
+
+
+                actions.append(action)
+                frame, reward, done, info = env.step(action)
+                obs = self.preprocess(frame)
+                rewards.append(reward)
+                dones.append(done)
+
+                cur_steps += 1
+
+            values = sess.run(
+                    self.critic_output_tensor,
+                    feed_dict={
+                        self.input_tensor: np.stack(states)
+                        },
             )
 
+            R = np.zeros_like(values)
 
-            # Instead of taking argmax, we sample from softmax probabilities.
-            # Also, probs tend to favor 1 action too strongly at first, let's
-            # add a bit of noise
-            action = np.random.choice(env.action_space.n,
-                p=np.ndarray.flatten(probs))
+            # If the episode did not end, len(rewards) == self.n, but if it did,
+            # len(rewards) <= self.n
+            for t in range(self.n):
+                if dones[t] == 1:
+                    cumulative_discounted = 0
+                else:
+                    cumulative_discounted = values[t]
 
-            actions.append(action)
-            frame, reward, done, info = env.step(action)
-            obs = self.preprocess(frame)
-            rewards.append(reward)
+                for t_prime in range(len(rewards) - t - 1, t-1, -1):
+                    cumulative_discounted = rewards[t_prime] + self.gamma * \
+                        cumulative_discounted
+                R[t] = cumulative_discounted
 
-        return np.array(states), np.array(actions), np.array(rewards)
+                if dones[t] == 1:
+                    break
 
-    def train(self):
-        states, actions, rewards = self.generate_episode()
 
-        values = sess.run(
-                self.critic_output_tensor,
-                feed_dict={
-                    self.input_tensor: np.stack(states)
+            '''
+            N = self.n
+            T = len(rewards)
+            exp = self.gamma ** N
+            for t in range(T-1, -1, -1):
+                v_end = 0 if t+N >= T else values[t + N]
+                cumulative = 0
+                for k in range(N-1):
+                    cumulative += (self.gamma ** k) * (rewards[t+k] if t+k < T else 0)
+                R[t] = exp * v_end + cumulative
+            '''
+
+            actor_loss, critic_loss, entropy, _ = sess.run(
+                    [self.actor_loss, self.critic_loss, self.entropy, self.train_both],
+                    feed_dict={
+                        self.input_tensor: np.stack(states),
+                        self.A_tensor: actions,
+                        self.R_tensor: R.reshape((-1)),
+                        self.advantage_tensor: np.ndarray.flatten(R - values),
                     },
-        )
+            )
 
-        R = np.zeros_like(values)
-        N = self.n
-        T = len(rewards)
-        exp = self.gamma ** N
-        for t in range(T-1, -1, -1):
-            v_end = 0 if t+N >= T else values[t + N]
-            cumulative = 0
-            for k in range(N-1):
-                cumulative += (self.gamma ** k) * (rewards[t+k] if t+k < T else 0)
-            R[t] = exp * v_end + cumulative
+            total_steps += cur_steps
+            total_reward += np.sum(rewards)
+            total_actor_loss += actor_loss
+            total_critic_loss += critic_loss
+            iterations += 1
+            cur_steps = 0
 
-        actor_loss, critic_loss, _ = sess.run(
-                [self.actor_loss, self.critic_loss, self.train_both],
-                feed_dict={
-                    self.input_tensor: np.stack(states),
-                    self.A_tensor: actions,
-                    self.R_tensor: R.reshape((-1)),
-                    self.advantage_tensor: np.ndarray.flatten(R - values),
-                },
-        )
-
-        return (actor_loss, critic_loss, np.sum(rewards), len(rewards))
+        return (total_actor_loss / iterations, total_critic_loss / iterations,
+            total_reward, total_steps, iterations)
 
 
     def test(self):
@@ -242,7 +299,7 @@ class A2C:
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--num-episodes', dest='num_episodes', type=int, default=4000000)
+    parser.add_argument('--num-episodes', dest='num_episodes', type=int, default=1000000)
     parser.add_argument('--lr', dest='lr', type=float, default=5e-4)
     parser.add_argument('--gamma', dest='gamma', type=float, default=0.99)
     parser.add_argument('--n', dest='n', type=int, default=10000)
@@ -263,6 +320,7 @@ def main(args):
     episode_lens = []
     losses = []
     critic_losses = []
+    total_iterations = 0
 
     current_total_reward = 0
     current_total_ep_len = 0
@@ -270,13 +328,16 @@ def main(args):
     current_total_critic_loss = 0
 
     for episode in range(num_episodes):
-        loss, critic_loss, total_reward, episode_len = a2c.train()
+        loss, critic_loss, total_reward, episode_len, iterations = a2c.train()
+        total_iterations += iterations
         print('#' * 50)
         print('Episode: %d' % episode)
         print('Reward: %f' % total_reward)
         print('Steps: %d' % episode_len)
         print('Loss: %f' % loss)
         print('Critic loss: %f' % critic_loss)
+        print('Iterations: %d' % iterations)
+        print('Total iterations: %d' % total_iterations)
 
         current_total_reward += total_reward
         current_total_ep_len += episode_len
