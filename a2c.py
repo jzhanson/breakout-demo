@@ -43,14 +43,8 @@ class A2C:
         self.gamma = gamma
         self.num_actions = env.action_space.n
 
-        self.last_three_frames = deque([np.zeros((110, 84), dtype=np.uint8),
-            np.zeros((110, 84), dtype=np.uint8),
-            np.zeros((110, 84), dtype=np.uint8),])
-
         self.make_model()
 
-    # We use the following three functions to wrap the last 3 frames in with the
-    # current frame - elsewhere, the state is treated as an opaque thing.
     def preprocess(self, frame):
         # grayscaling
         # 0.299, 0.587, 0.114
@@ -66,19 +60,11 @@ class A2C:
         # Could add in anti-aliasing=true but need newest scikit-image
         gray_small_image = resize(gray_image, (110, 84))
 
-        # Include last 3 frames as well, in the order earliest to latest
-
-        self.last_three_frames.append(gray_small_image)
-
-        obs = np.stack(self.last_three_frames, axis=-1)
-        # Drop oldest frame
-        self.last_three_frames.popleft()
-
-        return obs
+        return gray_small_image
 
 
     def make_model(self):
-        self.input_tensor = tf.placeholder(tf.float32, shape=(None, 110, 84, 4))
+        self.input_tensor = tf.placeholder(tf.float32, shape=(None, 110, 84))
 
         self.R_tensor = tf.placeholder(tf.float32, shape=[None])
         self.A_tensor = tf.placeholder(tf.int32, shape=[None])
@@ -91,7 +77,7 @@ class A2C:
 
         with tf.variable_scope("policy"):
             conv1 = tf.layers.conv2d(
-                    inputs=tf.cast(self.input_tensor, tf.float32) / 255,
+                    inputs=tf.expand_dims((tf.cast(self.input_tensor, tf.float32) / 255), -1),
                     filters=32,
                     kernel_size=[8,8],
                     strides=4,
@@ -155,7 +141,6 @@ class A2C:
         )
 
         # sparse_softmax_cross_entropy is already negative, so don't need - here
-        # Can change reduce_mean to reduce_sum??
         self.actor_loss = tf.reduce_mean(self.advantage_tensor *    \
             neg_log_action_probabilities)
         self.critic_loss = tf.reduce_mean(tf.square(self.R_tensor -     \
@@ -189,7 +174,7 @@ class A2C:
 
 
     # Performs one episode of training in iterations of n steps each
-    def train(self, render=True):
+    def train(self, render=False):
         obs = self.preprocess(env.reset())
         if render:
             env.render()
@@ -199,6 +184,7 @@ class A2C:
         total_reward = 0
         total_actor_loss = 0
         total_critic_loss = 0
+        total_entropy = 0
         iterations = 0
 
         while not done:
@@ -220,11 +206,9 @@ class A2C:
                     },
                 )
 
-                action = np.argmax(probs)
-                '''
+                #action = np.argmax(probs)
                 action = np.random.choice(env.action_space.n,
                     p=np.ndarray.flatten(probs))
-                '''
 
 
                 actions.append(action)
@@ -287,11 +271,12 @@ class A2C:
             total_reward += np.sum(rewards)
             total_actor_loss += actor_loss
             total_critic_loss += critic_loss
+            total_entropy += entropy
             iterations += 1
             cur_steps = 0
 
         return (total_actor_loss / iterations, total_critic_loss / iterations,
-            total_reward, total_steps, iterations)
+            total_entropy / iterations, total_reward, total_steps, iterations)
 
 
     def test(self):
@@ -320,15 +305,17 @@ def main(args):
     episode_lens = []
     losses = []
     critic_losses = []
+    entropies = []
     total_iterations = 0
 
     current_total_reward = 0
     current_total_ep_len = 0
     current_total_loss = 0
     current_total_critic_loss = 0
+    current_total_entropy = 0
 
     for episode in range(num_episodes):
-        loss, critic_loss, total_reward, episode_len, iterations = a2c.train()
+        loss, critic_loss, entropy, total_reward, episode_len, iterations = a2c.train()
         total_iterations += iterations
         print('#' * 50)
         print('Episode: %d' % episode)
@@ -336,6 +323,7 @@ def main(args):
         print('Steps: %d' % episode_len)
         print('Loss: %f' % loss)
         print('Critic loss: %f' % critic_loss)
+        print('Entropy: %f' % entropy)
         print('Iterations: %d' % iterations)
         print('Total iterations: %d' % total_iterations)
 
@@ -343,19 +331,20 @@ def main(args):
         current_total_ep_len += episode_len
         current_total_loss += loss
         current_total_critic_loss += critic_loss
+        current_total_entropy += entropy
 
         if episode % 100 == 0:
             rewards.append(current_total_reward / 100)
             episode_lens.append(current_total_ep_len / 100)
             losses.append(current_total_loss / 100)
             critic_losses.append(current_total_critic_loss / 100)
+            entropies.append(current_total_entropy / 100)
 
             current_total_reward = 0
             current_total_ep_len = 0
             current_total_loss = 0
             current_total_critic_loss = 0
-
-
+            current_total_entropy = 0
 
             if not os.path.exists('saves'):
                 os.mkdir('saves')
@@ -386,6 +375,15 @@ def main(args):
             plt.xlabel('Episodes')
             plt.ylabel('Average loss per 100 episodes')
             plt.savefig('losses_a2c.png')
+
+            plt.clf()
+            entropy_line = plt.plot([100*i for i in range(len(entropies))], entropies, aa=True)
+            plt.axis([0, 100*(len(episode_lens)+1), 0, 5])
+
+            plt.xlabel('Episodes')
+            plt.ylabel('Average entropy per 100 episodes')
+            plt.savefig('entropy_a2c.png')
+
 
 
 
