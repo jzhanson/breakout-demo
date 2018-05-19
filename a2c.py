@@ -24,9 +24,9 @@ sess = tf.Session(config=config)
 
 # tf.set_random_seed(seed)
 
-# Wraps Breakout environment by grayscaling and resizing the images to 84x84,
-# stacking 4 frames to form the observation, takes fire action to begin episode,
-# treats loss of life as end of an episode.
+# Wraps Breakout environment by grayscaling and cropping + resizing the images
+# to 84x84, stacking 4 frames to form the observation, takes fire action to
+# begin episode, treats loss of life as end of an episode.
 class WrapperEnv(gym.Wrapper):
     def __init__(self, env, num_stack=4):
         gym.Wrapper.__init__(self, env)
@@ -44,7 +44,8 @@ class WrapperEnv(gym.Wrapper):
 
     def grayscale_resize(self, frame):
         #obs = resize(np.array(frame)[...,:3].dot([0.299, 0.587, 0.114]), (84, 84))
-        gray_frame = np.dot(frame.astype('float32'),
+        cropped_frame = frame[34:-16,:,:]
+        gray_frame = np.dot(cropped_frame.astype('float32'),
             np.array([0.299, 0.587, 0.114], 'float32'))
         obs = np.array(Image.fromarray(gray_frame).resize((self.side, self.side),
                         resample=Image.BILINEAR), dtype=np.uint8)
@@ -102,6 +103,13 @@ class A2C:
         self.gamma = gamma
         self.num_envs = num_envs
 
+        self.env = gym.make('BreakoutNoFrameskip-v4')
+        self.env = WrapperEnv(self.env)
+        self.env = gym.wrappers.Monitor(self.env, './videos_a2c', force=True,
+            video_callable=lambda episode_id: episode_id%100==0)
+
+
+        '''
         self.envs = [gym.make('BreakoutNoFrameskip-v4') for i in
             range(self.num_envs)]
 
@@ -111,6 +119,7 @@ class A2C:
             video_callable=lambda episode_id: episode_id%100==0), self.envs))
 
         self.obs_arr = []
+        '''
 
         self.make_model()
 
@@ -167,7 +176,7 @@ class A2C:
 
             self.actor_policy_logits = tf.contrib.layers.fully_connected(
                     fully_connected,
-                    self.envs[0].action_space.n,
+                    self.env.action_space.n,
                     activation_fn=None,
                     weights_initializer=tf.initializers.orthogonal()
             )
@@ -226,7 +235,97 @@ class A2C:
 
 
     # Performs one iteration of n or fewer steps on each environment
-    def train(self, render=False):
+    def train(self, render=True):
+        obs = self.env.reset()
+
+        if render:
+            self.env.render()
+        done = False
+        cur_steps = 0
+        total_steps = 0
+        total_reward = 0
+        total_actor_loss = 0
+        total_critic_loss = 0
+        total_entropy = 0
+        iterations = 0
+
+        while not done:
+            states = []
+            actions = []
+            rewards = []
+            dones = []
+
+            while cur_steps < self.n and not done:
+                if render:
+                    self.env.render()
+                states.append(obs)
+
+                probs = sess.run(
+                    self.actor_output_tensor,
+                    feed_dict={
+                        self.input_tensor: np.array([obs])
+                    },
+                )
+
+                #action=np.argmax(probs)
+                action = np.random.choice(self.env.action_space.n,
+                    p=np.ndarray.flatten(probs))
+
+                actions.append(action)
+                obs, reward, done, info = self.env.step(action)
+                rewards.append(reward)
+                dones.append(done)
+
+                cur_steps += 1
+
+            values = sess.run(
+                self.critic_output_tensor,
+                feed_dict={
+                    self.input_tensor: np.stack(states)
+                },
+            )
+
+            R = np.zeros_like(values)
+
+            for t in range(self.n):
+                if dones[t] == 1:
+                    cumulative_discounted = 0
+                else:
+                    cumulative_discounted = values[t]
+
+                for t_prime in range(len(rewards) - 1, t-1, -1):
+                    cumulative_discounted = rewards[t_prime] + self.gamma * \
+                        cumulative_discounted
+
+                R[t] = cumulative_discounted
+
+                if dones[t] == 1:
+                    break
+
+            actor_loss, critic_loss, entropy, _ = sess.run(
+                [self.actor_loss, self.critic_loss, self.entropy, self.train_both],
+                feed_dict={
+                    self.input_tensor: np.stack(states),
+                    self.A_tensor: actions,
+                    self.R_tensor:  R.reshape((-1)),
+                    self.advantage_tensor: np.ndarray.flatten(R - values),
+                },
+            )
+
+            total_steps += cur_steps
+            total_reward += np.sum(rewards)
+            total_actor_loss += actor_loss
+            total_critic_loss += critic_loss
+            total_entropy += entropy
+            iterations += 1
+            cur_steps = 0
+
+        return (total_actor_loss / iterations, total_critic_loss / iterations,
+            total_entropy / iterations, total_reward, total_steps, iterations)
+
+
+
+        '''
         if render:
             for i in range(self.num_envs):
                 self.envs[i].render()
@@ -302,7 +401,7 @@ class A2C:
                 else:
                     cumulative_discounted = values[t]
 
-                for t_prime in range(len(multi_rewards[i]) - t - 1, t-1, -1):
+                for t_prime in range(len(multi_rewards[i]) - 1, t-1, -1):
                     cumulative_discounted = multi_rewards[i][t_prime] + self.gamma * \
                             cumulative_discounted
                 R[t] = cumulative_discounted
@@ -337,6 +436,7 @@ class A2C:
         return actor_loss, critic_loss, entropy, np.sum(multi_rewards) /    \
             self.num_envs, np.sum(list(map(lambda l : len(l), multi_rewards))),\
             4*(total_steps // self.n + 1)
+        '''
 
 
 
@@ -377,23 +477,25 @@ def main(args):
     current_total_entropy = 0
 
 
+    '''
     a2c.obs_arr = np.array(list(map(lambda env: env.reset(), a2c.envs)))
+    '''
 
     for episode in range(num_episodes):
-        loss, critic_loss, entropy, avg_reward, avg_episode_len, iterations = a2c.train()
+        loss, critic_loss, entropy, total_reward, episode_len, iterations = a2c.train()
         total_iterations += iterations
         print('#' * 50)
         print('Episode: %d' % episode)
-        print('Reward: %f' % avg_reward)
-        print('Steps: %f' % avg_episode_len)
+        print('Reward: %f' % total_reward)
+        print('Steps: %f' % episode_len)
         print('Loss: %f' % loss)
         print('Critic loss: %f' % critic_loss)
         print('Entropy: %f' % entropy)
         print('Iterations: %d' % iterations)
         print('Total iterations: %d' % total_iterations)
 
-        current_total_reward += avg_reward
-        current_total_ep_len += avg_episode_len
+        current_total_reward += total_reward
+        current_total_ep_len += episode_len
         current_total_loss += loss
         current_total_critic_loss += critic_loss
         current_total_entropy += entropy
