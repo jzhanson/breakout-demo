@@ -103,14 +103,13 @@ class A2C:
         self.gamma = gamma
         self.num_envs = num_envs
 
-        '''
         self.env = gym.make('BreakoutNoFrameskip-v4')
         self.env = WrapperEnv(self.env)
         self.env = gym.wrappers.Monitor(self.env, './videos_a2c', force=True,
             video_callable=lambda episode_id: episode_id%100==0)
+
+
         '''
-
-
         self.envs = [gym.make('BreakoutNoFrameskip-v4') for i in
             range(self.num_envs)]
 
@@ -120,6 +119,7 @@ class A2C:
             video_callable=lambda episode_id: episode_id%100==0), self.envs))
 
         self.obs_arr = []
+        '''
 
         self.make_model()
 
@@ -176,7 +176,7 @@ class A2C:
 
             self.actor_policy_logits = tf.contrib.layers.fully_connected(
                     fully_connected,
-                    self.envs[0].action_space.n,
+                    self.env.action_space.n,
                     activation_fn=None,
                     weights_initializer=tf.initializers.orthogonal()
             )
@@ -214,15 +214,6 @@ class A2C:
         grads, grad_norm = tf.clip_by_global_norm(grads, 0.5)
         grads = list(zip(grads, params))
 
-        '''
-        learning_rate = tf.train.exponential_decay(self.lr, self.global_step,
-                                                    100000, 0.96, staircase=True)
-
-        self.train_both = tf.train.RMSPropOptimizer(learning_rate=learning_rate,
-            decay=0.99, epsilon=1e-5)
-        self.train_both = self.train_both.apply_gradients(grads,
-            global_step=self.global_step)
-        '''
         self.train_both = tf.train.RMSPropOptimizer(self.lr,
             decay=0.99, epsilon=1e-5)
         self.train_both = self.train_both.apply_gradients(grads)
@@ -235,7 +226,97 @@ class A2C:
 
 
     # Performs one iteration of n or fewer steps on each environment
-    def train(self, render=False):
+    def train(self, render=True):
+        obs = self.env.reset()
+
+        if render:
+            self.env.render()
+        done = False
+        cur_steps = 0
+        total_steps = 0
+        total_reward = 0
+        total_actor_loss = 0
+        total_critic_loss = 0
+        total_entropy = 0
+        iterations = 0
+
+        while not done:
+            states = []
+            actions = []
+            rewards = []
+            dones = []
+
+            while cur_steps < self.n and not done:
+                if render:
+                    self.env.render()
+                states.append(obs)
+
+                probs = sess.run(
+                    self.actor_output_tensor,
+                    feed_dict={
+                        self.input_tensor: np.array([obs])
+                    },
+                )
+
+                action = np.argmax(probs)
+                '''
+                action = np.random.choice(self.env.action_space.n,
+                    p=np.ndarray.flatten(probs))
+                '''
+
+                actions.append(action)
+                obs, reward, done, info = self.env.step(action)
+                rewards.append(reward)
+                dones.append(done)
+
+                cur_steps += 1
+
+            values = sess.run(
+                self.critic_output_tensor,
+                feed_dict={
+                    self.input_tensor: np.stack(states)
+                },
+            )
+
+            R = np.zeros_like(values)
+
+            for t in range(self.n):
+                if dones[t] == 1:
+                    cumulative_discounted = 0
+                else:
+                    cumulative_discounted = values[t]
+
+                for t_prime in range(len(rewards) - 1, t-1, -1):
+                    cumulative_discounted = rewards[t_prime] + self.gamma * \
+                        cumulative_discounted
+
+                R[t] = cumulative_discounted
+
+                if dones[t] == 1:
+                    break
+
+            actor_loss, critic_loss, entropy, _ = sess.run(
+                [self.actor_loss, self.critic_loss, self.entropy, self.train_both],
+                feed_dict={
+                    self.input_tensor: np.stack(states),
+                    self.A_tensor: actions,
+                    self.R_tensor:  R.reshape((-1)),
+                    self.advantage_tensor: np.ndarray.flatten(R - values),
+                },
+            )
+
+            total_steps += cur_steps
+            total_reward += np.sum(rewards)
+            total_actor_loss += actor_loss
+            total_critic_loss += critic_loss
+            total_entropy += entropy
+            iterations += 1
+            cur_steps = 0
+
+        return (total_actor_loss / iterations, total_critic_loss / iterations,
+            total_entropy / iterations, total_reward, total_steps, iterations)
+
+        '''
         obs = list(map(lambda env: env.reset(), self.envs))
 
         if render:
@@ -358,124 +439,7 @@ class A2C:
 
         return (total_actor_loss / iterations, total_critic_loss / iterations,
             total_entropy / iterations, total_reward / self.num_envs, total_steps / self.num_envs, iterations)
-
-
-
         '''
-        if render:
-            for i in range(self.num_envs):
-                self.envs[i].render()
-
-        multi_obs, multi_actions, multi_rewards, multi_dones = [[] for i \
-            in range(self.num_envs)], [[] for i in range(self.num_envs)], \
-            [[] for i in range(self.num_envs)], [[] for i in    \
-            range(self.num_envs)]
-
-        total_steps = 0
-
-        for i in range(self.num_envs):
-            current_obs = []
-            current_actions = []
-            current_rewards = []
-            current_dones = []
-
-            current_steps = 0
-
-            while current_steps < self.n:
-                # Predict takes a np array of observations as the batch
-                probs = sess.run(
-                    self.actor_output_tensor,
-                    feed_dict={
-                        self.input_tensor: np.array([self.obs_arr[i]])
-                    },
-                )
-
-
-                #action = np.argmax(probs)
-                action = np.random.choice(self.envs[i].action_space.n,
-                    p=np.ndarray.flatten(probs))
-
-                single_obs, reward, done, info = self.envs[i].step(action)
-                current_obs.append(self.obs_arr[i])
-                self.obs_arr[i] = single_obs
-                current_actions.append(action)
-                current_rewards.append(reward)
-                current_dones.append(done)
-
-                current_steps += 1
-
-                if done:
-                    self.obs_arr[i] = self.envs[i].reset()
-                    print('env %d done' % i)
-                    break
-
-            multi_obs[i] = current_obs
-            multi_actions[i] = current_actions
-            multi_rewards[i] = current_rewards
-            multi_dones[i] = current_dones
-
-            total_steps += current_steps
-
-
-        multi_Rs = [[] for i in range(self.num_envs)]
-        multi_values = [[] for i in range(self.num_envs)]
-
-        for i in range(self.num_envs):
-            values = sess.run(
-                self.critic_output_tensor,
-                feed_dict={
-                    self.input_tensor: multi_obs[i]
-                    },
-                )
-            R = np.zeros_like(values)
-
-            # If the episode did not end, len(rewards) == self.n, but if it did,
-            # len(rewards) <= self.n
-            for t in range(self.n):
-                if multi_dones[i][t] == 1:
-                    cumulative_discounted = 0
-                else:
-                    cumulative_discounted = values[t]
-
-                for t_prime in range(len(multi_rewards[i]) - 1, t-1, -1):
-                    cumulative_discounted = multi_rewards[i][t_prime] + self.gamma * \
-                            cumulative_discounted
-                R[t] = cumulative_discounted
-
-                if multi_dones[i][t] == 1:
-                    break
-
-            multi_Rs[i] = R
-            multi_values[i] = values
-
-        multi_obs = np.array(multi_obs)
-        multi_actions = np.array(multi_actions)
-        multi_Rs = np.array(multi_Rs)
-        multi_values = np.array(multi_values)
-
-        print(multi_obs.shape)
-        print(multi_actions.shape)
-
-        print(multi_Rs.shape)
-        print(multi_values.shape)
-
-        actor_loss, critic_loss, entropy, _ = sess.run(
-                [self.actor_loss, self.critic_loss, self.entropy, self.train_both],
-                feed_dict={
-                    self.input_tensor: multi_obs.reshape(-1, *multi_obs.shape[-3:]),
-                    self.A_tensor: np.ndarray.flatten(multi_actions),
-                    self.R_tensor: np.ndarray.flatten(multi_Rs),
-                    self.advantage_tensor: np.ndarray.flatten(multi_Rs - multi_values),
-                },
-        )
-
-        return actor_loss, critic_loss, entropy, np.sum(multi_rewards) /    \
-            self.num_envs, np.sum(list(map(lambda l : len(l), multi_rewards))),\
-            4*(total_steps // self.n + 1)
-        '''
-
-
-
 
     def test(self):
         pass
