@@ -59,9 +59,9 @@ class WrapperEnv(gym.Wrapper):
             self.started = True
             self.out_of_lives = False
             obs, reward, done, info = self._step(1)
-        # Press fire at the beginning or NOOP if lives not exhausted
+        # Press fire at the beginning
         else:
-            obs, reward, done, info = self._step(0)
+            obs, reward, done, info = self._step(1)
 
         self.lives = self.env.unwrapped.ale.lives()
         return self._observation()
@@ -135,6 +135,8 @@ class A2C:
 
         self.global_step = tf.Variable(0, trainable=False)
 
+        self.lr_tensor = tf.placeholder(tf.float32, shape=[])
+
         with tf.variable_scope("policy"):
             conv1 = tf.layers.conv2d(
                     inputs=(tf.cast(self.input_tensor, tf.float32) / 255),
@@ -184,8 +186,11 @@ class A2C:
             # Add a little noise to encourage exploration!
             # self.actor_output_three = tf.nn.softmax(self.actor_policy_logits - tf.log(-tf.log(noise)))
             # self.actor_output_tesnor = tf.nn.softmax(self.actor_policy_logits + noise)
+            '''
             noise = tf.random_uniform(tf.shape(self.actor_policy_logits))
             self.actor_output_tensor = tf.nn.softmax(self.actor_policy_logits - tf.log(-tf.log(noise)), 1)
+            '''
+            self.actor_output_tensor = tf.nn.softmax(self.actor_policy_logits)
 
 
             self.critic_output_tensor = tf.contrib.layers.fully_connected(
@@ -203,8 +208,9 @@ class A2C:
         # sparse_softmax_cross_entropy is already negative, so don't need - here
         self.actor_loss = tf.reduce_mean(self.advantage_tensor *    \
             neg_log_action_probabilities)
+        # For some reason reference implementation has mse be / 2
         self.critic_loss = tf.reduce_mean(tf.square(self.R_tensor -     \
-            tf.squeeze(self.critic_output_tensor)))
+            tf.squeeze(self.critic_output_tensor)) / 2)
         self.entropy = tf.reduce_mean(openai_entropy(self.actor_policy_logits))
         self.loss = self.actor_loss + 0.5 * self.critic_loss - 0.01 * self.entropy
 
@@ -214,15 +220,17 @@ class A2C:
         grads, grad_norm = tf.clip_by_global_norm(grads, 0.5)
         grads = list(zip(grads, params))
 
-        self.train_both = tf.train.RMSPropOptimizer(self.lr,
+        '''
+        self.optimizer = tf.train.RMSPropOptimizer(self.lr_tensor,
             decay=0.99, epsilon=1e-5)
-        self.train_both = self.train_both.apply_gradients(grads)
+        '''
+        self.optimizer = tf.train.RMSPropOptimizer(self.lr,
+            decay=0.99, epsilon=1e-5)
 
+        self.train_both = self.optimizer.apply_gradients(grads)
 
-        self.saver = tf.train.Saver(max_to_keep=5)
+        self.saver = tf.train.Saver(max_to_keep=1)
         sess.run(tf.global_variables_initializer())
-
-
 
 
     # Performs one iteration of n or fewer steps on each environment
@@ -251,18 +259,18 @@ class A2C:
                     self.env.render()
                 states.append(obs)
 
-                probs = sess.run(
-                    self.actor_output_tensor,
+                probs, logits = sess.run(
+                    [self.actor_output_tensor, self.actor_policy_logits],
                     feed_dict={
                         self.input_tensor: np.array([obs])
                     },
                 )
 
-                action = np.argmax(probs)
-                '''
+                sys.stdout.write('\r' + str(probs))
+                sys.stdout.flush()
+                #action = np.argmax(probs)
                 action = np.random.choice(self.env.action_space.n,
                     p=np.ndarray.flatten(probs))
-                '''
 
                 actions.append(action)
                 obs, reward, done, info = self.env.step(action)
@@ -271,13 +279,33 @@ class A2C:
 
                 cur_steps += 1
 
-            values = sess.run(
+            last_value = sess.run(
                 self.critic_output_tensor,
                 feed_dict={
-                    self.input_tensor: np.stack(states)
+                    self.input_tensor: np.array([obs])
                 },
             )
 
+            values = sess.run(
+                self.critic_output_tensor,
+                feed_dict={
+                    self.input_tensor: np.array(states)
+                },
+            )
+
+            R = np.zeros_like(np.array(values))
+
+            if dones[-1] == 1:
+                cumulative_discounted = 0
+            else:
+                cumulative_discounted = last_value
+
+            for t in range(len(rewards)-1, -1, -1):
+                cumulative_discounted = rewards[t] + self.gamma * cumulative_discounted
+                R[t] = cumulative_discounted
+
+
+            '''
             R = np.zeros_like(values)
 
             for t in range(self.n):
@@ -294,12 +322,13 @@ class A2C:
 
                 if dones[t] == 1:
                     break
+            '''
 
             actor_loss, critic_loss, entropy, _ = sess.run(
                 [self.actor_loss, self.critic_loss, self.entropy, self.train_both],
                 feed_dict={
-                    self.input_tensor: np.stack(states),
-                    self.A_tensor: actions,
+                    self.input_tensor: np.array(states),
+                    self.A_tensor: np.array(actions),
                     self.R_tensor:  R.reshape((-1)),
                     self.advantage_tensor: np.ndarray.flatten(R - values),
                 },
@@ -488,17 +517,21 @@ def main(args):
         for i in range(5):
             sub_loss, sub_critic_loss, sub_entropy, sub_total_reward, sub_episode_len, sub_iterations = a2c.train()
             loss += sub_loss
-            critic_loss += critic_loss
+            critic_loss += sub_critic_loss
             entropy += sub_entropy
             total_reward += sub_total_reward
             episode_len += sub_episode_len
             iterations += sub_iterations
         total_iterations += iterations
+        entropy = entropy / 5
+        loss = loss / 5
+        critic_loss = critic_loss / 5
+        print('\n')
         print('#' * 50)
         print('Episode: %d' % episode)
         print('Reward: %f' % total_reward)
         print('Steps: %f' % episode_len)
-        print('Loss: %f' % loss)
+        print('Loss: %f' % )
         print('Critic loss: %f' % critic_loss)
         print('Entropy: %f' % entropy)
         print('Iterations: %d' % iterations)
@@ -536,7 +569,7 @@ def main(args):
 
             plt.clf()
             episode_length_line = plt.plot([100*i for i in range(len(episode_lens))], episode_lens, aa=True)
-            plt.axis([0, 100*(len(episode_lens)+1), 0, 1000])
+            plt.axis([0, 100*(len(episode_lens)+1), 0, 2000])
 
             plt.xlabel('Episodes')
             plt.ylabel('Average episode length per 100 episodes')
@@ -547,7 +580,7 @@ def main(args):
             critic_loss_line = plt.plot([100*i for i in range(len(critic_losses))], critic_losses, aa=True, label='Critic loss')
 
             plt.legend()
-            plt.axis([0, 100*(len(losses)+1), 0, 0.5])
+            plt.axis([0, 100*(len(losses)+1), -0.1, 0.1])
 
             plt.xlabel('Episodes')
             plt.ylabel('Average loss per 100 episodes')
@@ -555,13 +588,11 @@ def main(args):
 
             plt.clf()
             entropy_line = plt.plot([100*i for i in range(len(entropies))], entropies, aa=True)
-            plt.axis([0, 100*(len(episode_lens)+1), 0, 5])
+            plt.axis([0, 100*(len(episode_lens)+1), 0, 2])
 
             plt.xlabel('Episodes')
             plt.ylabel('Average entropy per 100 episodes')
             plt.savefig('entropy_a2c.png')
-
-
 
 
 
