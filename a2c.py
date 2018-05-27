@@ -97,17 +97,21 @@ def openai_entropy(logits):
 
 class A2C:
     # Initialize model, variables
-    def __init__(self, lr, gamma, n, num_envs=4):
+    def __init__(self, lr, num_episodes, gamma, n, num_envs=4):
         self.lr = lr
+        self.decay_steps = 0
+        self.decay_max = num_episodes
+
         self.n = n
         self.gamma = gamma
         self.num_envs = num_envs
 
         self.env = gym.make('BreakoutNoFrameskip-v4')
-        self.env = WrapperEnv(self.env)
         self.env = gym.wrappers.Monitor(self.env, './videos_a2c', force=True,
             video_callable=lambda episode_id: episode_id%100==0)
 
+        self.env = WrapperEnv(self.env)
+        self.num_actions = self.env.action_space.n
 
         '''
         self.envs = [gym.make('BreakoutNoFrameskip-v4') for i in
@@ -119,12 +123,15 @@ class A2C:
             video_callable=lambda episode_id: episode_id%100==0), self.envs))
 
         self.obs_arr = []
+
+        self.num_actions = self.envs[0].action_space.n
         '''
 
         self.make_model()
 
 
     def make_model(self):
+
         self.input_tensor = tf.placeholder(tf.float32, shape=(None, 84, 84, 4))
 
         self.R_tensor = tf.placeholder(tf.float32, shape=[None])
@@ -178,14 +185,13 @@ class A2C:
 
             self.actor_policy_logits = tf.contrib.layers.fully_connected(
                     fully_connected,
-                    self.env.action_space.n,
+                    self.num_actions,
                     activation_fn=None,
                     weights_initializer=tf.initializers.orthogonal()
             )
 
-            # Add a little noise to encourage exploration!
-            # self.actor_output_three = tf.nn.softmax(self.actor_policy_logits - tf.log(-tf.log(noise)))
-            # self.actor_output_tesnor = tf.nn.softmax(self.actor_policy_logits + noise)
+            # Impossible to learn with noise (basically a random policy), while
+            # A2C is an on-policy algorithm
             '''
             noise = tf.random_uniform(tf.shape(self.actor_policy_logits))
             self.actor_output_tensor = tf.nn.softmax(self.actor_policy_logits - tf.log(-tf.log(noise)), 1)
@@ -208,7 +214,6 @@ class A2C:
         # sparse_softmax_cross_entropy is already negative, so don't need - here
         self.actor_loss = tf.reduce_mean(self.advantage_tensor *    \
             neg_log_action_probabilities)
-        # For some reason reference implementation has mse be / 2
         self.critic_loss = tf.reduce_mean(tf.square(self.R_tensor -     \
             tf.squeeze(self.critic_output_tensor)) / 2)
         self.entropy = tf.reduce_mean(openai_entropy(self.actor_policy_logits))
@@ -220,18 +225,23 @@ class A2C:
         grads, grad_norm = tf.clip_by_global_norm(grads, 0.5)
         grads = list(zip(grads, params))
 
-        '''
         self.optimizer = tf.train.RMSPropOptimizer(self.lr_tensor,
-            decay=0.99, epsilon=1e-5)
-        '''
-        self.optimizer = tf.train.RMSPropOptimizer(self.lr,
             decay=0.99, epsilon=1e-5)
 
         self.train_both = self.optimizer.apply_gradients(grads)
 
         self.saver = tf.train.Saver(max_to_keep=1)
+
         sess.run(tf.global_variables_initializer())
 
+        if os.path.exists('saves'):
+            self.saver.restore(sess, 'saves/')
+
+    # Learning rate decay is absolutely necessary to stabilize training
+    def decay_lr(self):
+        decayed = self.lr * (1 - self.decay_steps / self.decay_max)
+        self.decay_steps += 1
+        return decayed
 
     # Performs one iteration of n or fewer steps on each environment
     def train(self, render=True):
@@ -259,8 +269,8 @@ class A2C:
                     self.env.render()
                 states.append(obs)
 
-                probs, logits = sess.run(
-                    [self.actor_output_tensor, self.actor_policy_logits],
+                probs = sess.run(
+                    self.actor_output_tensor,
                     feed_dict={
                         self.input_tensor: np.array([obs])
                     },
@@ -268,10 +278,11 @@ class A2C:
 
                 sys.stdout.write('\r' + str(probs))
                 sys.stdout.flush()
-                #action = np.argmax(probs)
+                '''
                 action = np.random.choice(self.env.action_space.n,
                     p=np.ndarray.flatten(probs))
-
+                '''
+                action = np.argmax(probs)
                 actions.append(action)
                 obs, reward, done, info = self.env.step(action)
                 rewards.append(reward)
@@ -295,6 +306,8 @@ class A2C:
 
             R = np.zeros_like(np.array(values))
 
+            # Note!!! Only the last state value is wrapped into the rollout! Not
+            # the value for each state at each time-step!
             if dones[-1] == 1:
                 cumulative_discounted = 0
             else:
@@ -304,29 +317,12 @@ class A2C:
                 cumulative_discounted = rewards[t] + self.gamma * cumulative_discounted
                 R[t] = cumulative_discounted
 
-
-            '''
-            R = np.zeros_like(values)
-
-            for t in range(self.n):
-                if dones[t] == 1:
-                    cumulative_discounted = 0
-                else:
-                    cumulative_discounted = values[t]
-
-                for t_prime in range(len(rewards) - 1, t-1, -1):
-                    cumulative_discounted = rewards[t_prime] + self.gamma * \
-                        cumulative_discounted
-
-                R[t] = cumulative_discounted
-
-                if dones[t] == 1:
-                    break
-            '''
+            decayed_lr = self.decay_lr()
 
             actor_loss, critic_loss, entropy, _ = sess.run(
                 [self.actor_loss, self.critic_loss, self.entropy, self.train_both],
                 feed_dict={
+                    self.lr_tensor: decayed_lr,
                     self.input_tensor: np.array(states),
                     self.A_tensor: np.array(actions),
                     self.R_tensor:  R.reshape((-1)),
@@ -391,6 +387,10 @@ class A2C:
                         },
                     )
 
+                    sys.stdout.write('\r' + str(probs))
+                    sys.stdout.flush()
+
+
                     #action=np.argmax(probs)
                     action = np.random.choice(self.envs[i].action_space.n,
                         p=np.ndarray.flatten(probs))
@@ -405,29 +405,30 @@ class A2C:
                     cur_steps += 1
 
 
-                values = sess.run(
+                last_values = sess.run(
                     self.critic_output_tensor,
                     feed_dict={
-                        self.input_tensor: np.stack(states)
+                        self.input_tensor: np.array([obs[i]])
                     },
                 )
 
-                R = np.zeros_like(values)
+                values = sess.run(
+                    self.critic_output_tensor,
+                    feed_dict={
+                        self.input_tensor: np.array(states)
+                    },
+                )
 
-                for t in range(self.n):
-                    if dones[t] == 1:
-                        cumulative_discounted = 0
-                    else:
-                        cumulative_discounted = values[t]
+                R = np.zeros_like(np.array(values))
 
-                    for t_prime in range(len(rewards) - 1, t-1, -1):
-                        cumulative_discounted = rewards[t_prime] + self.gamma * \
-                            cumulative_discounted
+                if dones[-1] == 1:
+                    cumulative_discounted = 0
+                else:
+                    cumulative_discounted = last_value
 
+                for t in range(len(rewards)-1, -1, -1):
+                    cumulative_discounted = rewards[t] + self.gamma * cumulative_discounted
                     R[t] = cumulative_discounted
-
-                    if dones[t] == 1:
-                        break
 
 
                 all_states.append(np.array(states))
@@ -482,7 +483,6 @@ def parse_arguments():
 
     return parser.parse_args()
 
-
 def main(args):
     args = parse_arguments()
     lr = args.lr
@@ -490,7 +490,7 @@ def main(args):
     n = args.n
     num_episodes = args.num_episodes
 
-    a2c = A2C(lr, gamma, n)
+    a2c = A2C(lr, num_episodes, gamma, n)
 
     rewards = []
     episode_lens = []
@@ -498,6 +498,8 @@ def main(args):
     critic_losses = []
     entropies = []
     total_iterations = 0
+    max_reward = 0
+    max_rewards = []
 
     current_total_reward = 0
     current_total_ep_len = 0
@@ -526,16 +528,19 @@ def main(args):
         entropy = entropy / 5
         loss = loss / 5
         critic_loss = critic_loss / 5
+        if total_reward > max_reward:
+            max_reward = total_reward
         print('\n')
         print('#' * 50)
         print('Episode: %d' % episode)
         print('Reward: %f' % total_reward)
         print('Steps: %f' % episode_len)
-        print('Loss: %f' % )
+        print('Loss: %f' % loss)
         print('Critic loss: %f' % critic_loss)
         print('Entropy: %f' % entropy)
         print('Iterations: %d' % iterations)
         print('Total iterations: %d' % total_iterations)
+        print('Max reward so far: %d' % max_reward)
 
         current_total_reward += total_reward
         current_total_ep_len += episode_len
@@ -549,6 +554,7 @@ def main(args):
             losses.append(current_total_loss / 100)
             critic_losses.append(current_total_critic_loss / 100)
             entropies.append(current_total_entropy / 100)
+            max_rewards.append(max_reward)
 
             current_total_reward = 0
             current_total_ep_len = 0
@@ -569,7 +575,7 @@ def main(args):
 
             plt.clf()
             episode_length_line = plt.plot([100*i for i in range(len(episode_lens))], episode_lens, aa=True)
-            plt.axis([0, 100*(len(episode_lens)+1), 0, 2000])
+            plt.axis([0, 100*(len(episode_lens)+1), 0, 10000])
 
             plt.xlabel('Episodes')
             plt.ylabel('Average episode length per 100 episodes')
@@ -593,6 +599,14 @@ def main(args):
             plt.xlabel('Episodes')
             plt.ylabel('Average entropy per 100 episodes')
             plt.savefig('entropy_a2c.png')
+
+            plt.clf()
+            max_reward_line = plt.plot([100*i for i in range(len(max_rewards))], max_rewards, aa=True)
+            plt.axis([0, 100*(len(max_rewards)+1), 0, 500])
+
+            plt.xlabel('Episodes')
+            plt.ylabel('Max reward obtained so far')
+            plt.savefig('max_reward_a2c.png')
 
 
 
