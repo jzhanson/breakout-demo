@@ -1,338 +1,613 @@
+import os
 import sys
 import argparse
+from skimage.transform import resize
+from PIL import Image
 import numpy as np
-import tensorflow as tf
-import subprocess
-import keras
-import gym
-import os
-import json
-from time import time
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # or any {'0', '1', '2'}
-from keras.layers import *
+from collections import deque
 
+'''
 import matplotlib
 matplotlib.use('Agg')
+'''
 import matplotlib.pyplot as plt
+import tensorflow as tf
 
-rev = str(subprocess.run(["git", "rev-parse", "HEAD"], stdout=subprocess.PIPE).stdout, 'utf-8').strip()[:5]
-print("rev: %s" % rev)
+import gym
+from gym import spaces
 
-key = str(np.random.randint(1000))
-print("key: %s" % key)
-last = time()
+import time
 
-sess = tf.Session()
+gpu_ops = tf.GPUOptions(allow_growth=True)
+config = tf.ConfigProto(gpu_options=gpu_ops)
+sess = tf.Session(config=config)
 
-def critic_model():
-    layers = [
-        Dense(
-            16,
-            input_shape=[8],
-            kernel_initializer=keras.initializers.RandomNormal(mean=0.0, stddev=0.03, seed=None),
-        ),
-        BatchNormalization(),
-        Activation('relu'),
-        Dense(
-            16,
-            kernel_initializer=keras.initializers.RandomNormal(mean=0.0, stddev=0.03, seed=None),
-        ),
-        BatchNormalization(),
-        Activation('relu'),
-        Dense(
-            16,
-            kernel_initializer=keras.initializers.RandomNormal(mean=0.0, stddev=0.03, seed=None),
-        ),
-        BatchNormalization(),
-        Activation('relu'),
-        Dense(
-            1,
-            kernel_initializer=keras.initializers.RandomNormal(mean=0.0, stddev=0.03, seed=None),
-        ),
-    ]
-    return keras.models.Sequential(layers=layers)
+# tf.set_random_seed(seed)
+
+# Wraps Breakout environment by grayscaling and cropping + resizing the images
+# to 84x84, stacking 4 frames to form the observation, takes fire action to
+# begin episode, treats loss of life as end of an episode.
+class WrapperEnv(gym.Wrapper):
+    def __init__(self, env, num_stack=4):
+        gym.Wrapper.__init__(self, env)
+        self.num_stack = num_stack
+        shape = env.observation_space.shape
+        self.side = 84
+        self.observation_space = spaces.Box(low=0, high=255, shape=(shape[0],
+            shape[1], self.num_stack))
+
+        self.frames = deque([], maxlen=self.num_stack)
+
+        self.lives = 0
+        self.out_of_lives = False
+        self.started = False
+
+    def grayscale_resize(self, frame):
+        #obs = resize(np.array(frame)[...,:3].dot([0.299, 0.587, 0.114]), (84, 84))
+        cropped_frame = frame[34:-16,:,:]
+        gray_frame = np.dot(cropped_frame.astype('float32'),
+            np.array([0.299, 0.587, 0.114], 'float32'))
+        obs = np.array(Image.fromarray(gray_frame).resize((self.side, self.side),
+                        resample=Image.BILINEAR), dtype=np.uint8)
+        return obs
+
+    def _reset(self):
+        if self.out_of_lives or not self.started:
+            frame = self.grayscale_resize(self.env.reset())
+            for i in range(self.num_stack):
+                self.frames.append(frame)
+            self.started = True
+            self.out_of_lives = False
+            obs, reward, done, info = self._step(1)
+        # Press fire at the beginning
+        else:
+            obs, reward, done, info = self._step(1)
+
+        self.lives = self.env.unwrapped.ale.lives()
+        return self._observation()
+
+    def _step(self, action):
+        frame, reward, done, info = self.env.step(action)
+        self.out_of_lives = done
+        self.frames.append(self.grayscale_resize(frame))
+
+        lives = self.env.unwrapped.ale.lives()
+        if lives < self.lives and lives > 0:
+            done = True
+        # This if is redundant
+        if lives == 0:
+            self.out_of_lives = True
+        self.lives = lives
+
+        return self._observation(), reward, done, info
+
+    def _observation(self):
+        return np.stack(self.frames, axis=-1)
 
 
 
-class A2C(object):
-    def __init__(self, model, lr, critic_model, critic_lr, n=20):
-        # Initializes A2C.
-        # Args:
-        # - model: The actor model.
-        # - lr: Learning rate for the actor model.
-        # - critic_model: The critic model.
-        # - critic_lr: Learning rate for the critic model.
-        # - n: The value of N in N-step A2C.
-        self.n = n
+# Copied from https://github.com/MG2033/A2C/blob/master/layers.py
+def openai_entropy(logits):
+    # Entropy proposed by OpenAI in their A2C baseline
+    a0 = logits - tf.reduce_max(logits, 1, keep_dims=True)
+    ea0 = tf.exp(a0)
+    z0 = tf.reduce_sum(ea0, 1, keep_dims=True)
+    p0 = ea0 / z0
+    return tf.reduce_sum(p0 * (tf.log(z0) - a0), 1)
+
+class A2C:
+    # Initialize model, variables
+    def __init__(self, lr, num_episodes, gamma, n, num_envs=4):
         self.lr = lr
-        self.critic_lr = critic_lr
-        self.make_model(model, critic_model)
+        self.decay_steps = 0
+        self.decay_max = num_episodes
 
-    def make_model(self, model, critic_model):
-        # actor
-        self.input_tensor = tf.placeholder(tf.float32, shape=[None, 8])
+        self.n = n
+        self.gamma = gamma
+        self.num_envs = num_envs
+
+        self.env = gym.make('BreakoutNoFrameskip-v4')
+        self.env = gym.wrappers.Monitor(self.env, './videos_a2c', force=True,
+            video_callable=lambda episode_id: episode_id%100==0)
+
+        self.env = WrapperEnv(self.env)
+        self.num_actions = self.env.action_space.n
+
+        '''
+        self.envs = [gym.make('BreakoutNoFrameskip-v4') for i in
+            range(self.num_envs)]
+
+        self.envs = list(map(lambda e: WrapperEnv(e), self.envs))
+
+        self.envs = list(map(lambda e: gym.wrappers.Monitor(e, './videos_a2c', force=True,
+            video_callable=lambda episode_id: episode_id%100==0), self.envs))
+
+        self.obs_arr = []
+
+        self.num_actions = self.envs[0].action_space.n
+        '''
+
+        self.make_model()
+
+
+    def make_model(self):
+
+        self.input_tensor = tf.placeholder(tf.float32, shape=(None, 84, 84, 4))
+
         self.R_tensor = tf.placeholder(tf.float32, shape=[None])
         self.A_tensor = tf.placeholder(tf.int32, shape=[None])
+        # We have advantage_tensor be separate in order so the gradients for
+        # the actor don't go through the critic
+        self.advantage_tensor = tf.placeholder(tf.float32, shape=[None])
 
-        with tf.variable_scope("actor"):
-            self.actor_output_tensor = model(self.input_tensor)
+        self.global_step = tf.Variable(0, trainable=False)
 
-        with tf.variable_scope("critic"):
-            self.critic_output_tensor = critic_model(self.input_tensor)
+        self.lr_tensor = tf.placeholder(tf.float32, shape=[])
 
-        self.actor_optimizer = tf.train.AdamOptimizer(self.lr)
-        self.critic_optimizer = tf.train.AdamOptimizer(self.critic_lr)
+        with tf.variable_scope("policy"):
+            conv1 = tf.layers.conv2d(
+                    inputs=(tf.cast(self.input_tensor, tf.float32) / 255),
+                    filters=32,
+                    kernel_size=[8,8],
+                    strides=4,
+                    padding='valid',    # 'same'?
+                    activation=tf.nn.relu,
+                    kernel_initializer=tf.initializers.orthogonal()
+            )
+            conv2 = tf.layers.conv2d(
+                    inputs=conv1,
+                    filters=64,
+                    kernel_size=[4,4],
+                    strides=2,
+                    padding='valid',    # 'same'?
+                    activation=tf.nn.relu,
+                    kernel_initializer=tf.initializers.orthogonal()
+            )
+            conv3 = tf.layers.conv2d(
+                    inputs=conv2,
+                    filters=64,
+                    kernel_size=[3,3],
+                    strides=1,
+                    padding='valid',    # 'same'?
+                    activation=tf.nn.relu,
+                    kernel_initializer=tf.initializers.orthogonal()
+            )
 
-        action_probabilties = tf.einsum(
-            "ij,ij->i",
-            tf.one_hot(self.A_tensor, 4),
-            self.actor_output_tensor,
+            conv3_flat = tf.contrib.layers.flatten(conv3)
+
+            fully_connected = tf.contrib.layers.fully_connected(
+                    conv3_flat,
+                    512,
+                    activation_fn=tf.nn.relu,
+                    weights_initializer=tf.initializers.orthogonal()
+
+            )
+
+            self.actor_policy_logits = tf.contrib.layers.fully_connected(
+                    fully_connected,
+                    self.num_actions,
+                    activation_fn=None,
+                    weights_initializer=tf.initializers.orthogonal()
+            )
+
+            # Impossible to learn with noise (basically a random policy), while
+            # A2C is an on-policy algorithm
+            '''
+            noise = tf.random_uniform(tf.shape(self.actor_policy_logits))
+            self.actor_output_tensor = tf.nn.softmax(self.actor_policy_logits - tf.log(-tf.log(noise)), 1)
+            '''
+            self.actor_output_tensor = tf.nn.softmax(self.actor_policy_logits)
+
+
+            self.critic_output_tensor = tf.contrib.layers.fully_connected(
+                    fully_connected,
+                    1,
+                    activation_fn=None,
+                    weights_initializer=tf.initializers.orthogonal()
+            )
+
+        neg_log_action_probabilities = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            logits=self.actor_policy_logits,
+            labels=self.A_tensor
         )
 
-        difference = self.R_tensor - self.actor_output_tensor
+        # sparse_softmax_cross_entropy is already negative, so don't need - here
+        self.actor_loss = tf.reduce_mean(self.advantage_tensor *    \
+            neg_log_action_probabilities)
+        self.critic_loss = tf.reduce_mean(tf.square(self.R_tensor -     \
+            tf.squeeze(self.critic_output_tensor)) / 2)
+        self.entropy = tf.reduce_mean(openai_entropy(self.actor_policy_logits))
+        self.loss = self.actor_loss + 0.5 * self.critic_loss - 0.01 * self.entropy
 
-        self.actor_loss = -tf.reduce_sum(difference * tf.log(action_probabilties))
+        with tf.variable_scope("policy"):
+            params = tf.trainable_variables()
+        grads = tf.gradients(self.loss, params)
+        grads, grad_norm = tf.clip_by_global_norm(grads, 0.5)
+        grads = list(zip(grads, params))
 
-        self.critic_loss = tf.reduce_sum(tf.square(difference))
+        self.optimizer = tf.train.RMSPropOptimizer(self.lr_tensor,
+            decay=0.99, epsilon=1e-5)
 
-        self.train_critic = self.critic_optimizer.minimize(
-            self.critic_loss,
-            var_list=tf.trainable_variables(scope="critic"),
-        )
+        self.train_both = self.optimizer.apply_gradients(grads)
 
-        self.train_actor = self.actor_optimizer.minimize(
-            self.actor_loss,
-            var_list=tf.trainable_variables(scope="actor"),
-        )
+        self.saver = tf.train.Saver(max_to_keep=1)
 
-        self.saver = tf.train.Saver(max_to_keep=100)
         sess.run(tf.global_variables_initializer())
 
+        if os.path.exists('saves'):
+            self.saver.restore(sess, 'saves/')
 
-    def train(self, env, gamma=1.0):
-        states, actions, rewards = self.generate_episode(env)
+    # Learning rate decay is absolutely necessary to stabilize training
+    def decay_lr(self):
+        decayed = self.lr * (1 - self.decay_steps / self.decay_max)
+        self.decay_steps += 1
+        return decayed
 
-        values = sess.run(
-            self.critic_output_tensor,
-            feed_dict={
-                self.input_tensor: np.vstack(states)
-            },
-        )
+    # Performs one iteration of n or fewer steps on each environment
+    def train(self, render=True):
+        obs = self.env.reset()
 
-        R = np.zeros_like(values)
-        N = self.n
-        T = len(values)
-        cumulative = 0
-        exp = gamma ** N
-        for t in reversed(range(T)):
-            v_end = 0 if (t + N) >= T else values[t + N]
-            rem = rewards[t + N] if t + N < T else 0
-            cumulative = rewards[t] + gamma * cumulative
-            cumulative -= rem * exp
-            R[t] = exp * v_end + cumulative
-
-        actor_loss, critic_loss, _, _ = sess.run(
-            [self.actor_loss, self.critic_loss, self.train_actor, self.train_actor],
-            feed_dict={
-                self.input_tensor: np.vstack(states),
-                self.A_tensor : actions,
-                self.R_tensor : R,
-            },
-        )
-
-        return (actor_loss, critic_loss, np.sum(rewards), T)
-
-
-
-
-        return
-
-    def generate_episode(self, env, render=False):
-        # Generates an episode by executing the current policy in the given env.
-        # Returns:
-        # - a list of states, indexed by time step
-        # - a list of actions, indexed by time step
-        # - a list of rewards, indexed by time step
-        states = []
-        actions = []
-        rewards = []
-
-        obs = env.reset()
         if render:
-            env.render()
+            self.env.render()
         done = False
+        cur_steps = 0
+        total_steps = 0
+        total_reward = 0
+        total_actor_loss = 0
+        total_critic_loss = 0
+        total_entropy = 0
+        iterations = 0
 
         while not done:
-            if render:
-                env.render()
-            states.append(obs)
-            # Predict takes a np array of observations as the batch
-            probs = sess.run(
-                self.actor_output_tensor,
+            states = []
+            actions = []
+            rewards = []
+            dones = []
+
+            while cur_steps < self.n and not done:
+                if render:
+                    self.env.render()
+                states.append(obs)
+
+                probs = sess.run(
+                    self.actor_output_tensor,
+                    feed_dict={
+                        self.input_tensor: np.array([obs])
+                    },
+                )
+
+                sys.stdout.write('\r' + str(probs))
+                sys.stdout.flush()
+                '''
+                action = np.random.choice(self.env.action_space.n,
+                    p=np.ndarray.flatten(probs))
+                '''
+                action = np.argmax(probs)
+                actions.append(action)
+                obs, reward, done, info = self.env.step(action)
+                rewards.append(reward)
+                dones.append(done)
+
+                cur_steps += 1
+
+            last_value = sess.run(
+                self.critic_output_tensor,
                 feed_dict={
-                    self.input_tensor:np.matrix(obs),
+                    self.input_tensor: np.array([obs])
                 },
             )
-            # Instead of taking argmax, we sample from softmax probabilities,
-            # and also there's no need for actions to be one-hot
-            action = np.random.choice(env.action_space.n,
-                p=np.ndarray.flatten(probs))
 
-            actions.append(action)
-            obs, reward, done, info = env.step(action)
-            rewards.append(reward)
+            values = sess.run(
+                self.critic_output_tensor,
+                feed_dict={
+                    self.input_tensor: np.array(states)
+                },
+            )
 
-        return np.array(states), np.array(actions), np.array(rewards)
+            R = np.zeros_like(np.array(values))
 
+            # Note!!! Only the last state value is wrapped into the rollout! Not
+            # the value for each state at each time-step!
+            if dones[-1] == 1:
+                cumulative_discounted = 0
+            else:
+                cumulative_discounted = last_value
+
+            for t in range(len(rewards)-1, -1, -1):
+                cumulative_discounted = rewards[t] + self.gamma * cumulative_discounted
+                R[t] = cumulative_discounted
+
+            decayed_lr = self.decay_lr()
+
+            actor_loss, critic_loss, entropy, _ = sess.run(
+                [self.actor_loss, self.critic_loss, self.entropy, self.train_both],
+                feed_dict={
+                    self.lr_tensor: decayed_lr,
+                    self.input_tensor: np.array(states),
+                    self.A_tensor: np.array(actions),
+                    self.R_tensor:  R.reshape((-1)),
+                    self.advantage_tensor: np.ndarray.flatten(R - values),
+                },
+            )
+
+            total_steps += cur_steps
+            total_reward += np.sum(rewards)
+            total_actor_loss += actor_loss
+            total_critic_loss += critic_loss
+            total_entropy += entropy
+            iterations += 1
+            cur_steps = 0
+
+        return (total_actor_loss / iterations, total_critic_loss / iterations,
+            total_entropy / iterations, total_reward, total_steps, iterations)
+
+        '''
+        obs = list(map(lambda env: env.reset(), self.envs))
+
+        if render:
+            map(lambda env: env.render(), self.envs)
+        all_dones = [False for i in range(self.num_envs)]
+
+        cur_steps = 0
+        total_steps = 0
+        total_reward = 0
+        total_actor_loss = 0
+        total_critic_loss = 0
+        total_entropy = 0
+        iterations = 0
+
+        while False in all_dones:
+
+            all_states = []
+            all_actions = []
+            all_rewards = []
+
+            #all_values = []
+            all_Rs = []
+            all_advs = []
+
+            for i in range(self.num_envs):
+                if all_dones[i]:
+                    continue
+
+                states = []
+                actions = []
+                rewards = []
+                dones = []
+
+                while cur_steps < self.n and not all_dones[i]:
+                    if render:
+                        self.envs[i].render()
+                    states.append(obs[i])
+
+                    probs = sess.run(
+                        self.actor_output_tensor,
+                        feed_dict={
+                            self.input_tensor: np.array([obs[i]])
+                        },
+                    )
+
+                    sys.stdout.write('\r' + str(probs))
+                    sys.stdout.flush()
+
+
+                    #action=np.argmax(probs)
+                    action = np.random.choice(self.envs[i].action_space.n,
+                        p=np.ndarray.flatten(probs))
+
+                    actions.append(action)
+                    curr_obs, reward, done, info = self.envs[i].step(action)
+                    obs[i] = curr_obs
+                    rewards.append(reward)
+                    dones.append(done)
+                    all_dones[i] = done
+
+                    cur_steps += 1
+
+
+                last_values = sess.run(
+                    self.critic_output_tensor,
+                    feed_dict={
+                        self.input_tensor: np.array([obs[i]])
+                    },
+                )
+
+                values = sess.run(
+                    self.critic_output_tensor,
+                    feed_dict={
+                        self.input_tensor: np.array(states)
+                    },
+                )
+
+                R = np.zeros_like(np.array(values))
+
+                if dones[-1] == 1:
+                    cumulative_discounted = 0
+                else:
+                    cumulative_discounted = last_value
+
+                for t in range(len(rewards)-1, -1, -1):
+                    cumulative_discounted = rewards[t] + self.gamma * cumulative_discounted
+                    R[t] = cumulative_discounted
+
+
+                all_states.append(np.array(states))
+                all_actions.append(np.array(actions))
+                all_rewards.append(np.array(rewards))
+
+                #all_values.append(np.array(values))
+                all_Rs.append(np.array(R))
+                all_advs.append(np.array(R) - np.array(values))
+
+                total_steps += cur_steps
+                total_reward += np.sum(rewards)
+
+                cur_steps = 0
+
+
+            all_states = np.array(all_states)
+            all_actions = np.concatenate(all_actions)
+            all_rewards = np.array(all_rewards)
+            #all_values = np.array(all_values)
+            all_Rs = np.concatenate(all_Rs)
+            all_advs = np.concatenate(all_advs)
+
+            actor_loss, critic_loss, entropy, _ = sess.run(
+                [self.actor_loss, self.critic_loss, self.entropy, self.train_both],
+                feed_dict={
+                    self.input_tensor: np.concatenate(all_states),
+                    self.A_tensor: all_actions.reshape((-1)),
+                    self.R_tensor:  all_Rs.reshape((-1)),
+                    self.advantage_tensor: all_advs.reshape((-1)),
+                },
+            )
+
+            total_actor_loss += actor_loss
+            total_critic_loss += critic_loss
+            total_entropy += entropy
+            iterations += 1
+
+        return (total_actor_loss / iterations, total_critic_loss / iterations,
+            total_entropy / iterations, total_reward / self.num_envs, total_steps / self.num_envs, iterations)
+        '''
+
+    def test(self):
+        pass
 
 def parse_arguments():
-    # Command-line flags are defined here.
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model-config-path', dest='model_config_path',
-                        type=str, default='LunarLander-v2-config.json',
-                        help="Path to the actor model config file.")
-    parser.add_argument('--num-episodes', dest='num_episodes', type=int,
-                        default=50000, help="Number of episodes to train on.")
-    parser.add_argument('--lr', dest='lr', type=float,
-                        default=5e-4, help="The actor's learning rate.")
-    parser.add_argument('--gamma', dest='gamma', type=float,
-                        default=0.99, help="gamma value")
-    parser.add_argument('--critic-lr', dest='critic_lr', type=float,
-                        default=1e-4, help="The critic's learning rate.")
-    parser.add_argument('--n', dest='n', type=int,
-                        default=20, help="The value of N in N-step A2C.")
-
-    # https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse
-    parser_group = parser.add_mutually_exclusive_group(required=False)
-    parser_group.add_argument('--render', dest='render',
-                              action='store_true',
-                              help="Whether to render the environment.")
-    parser_group.add_argument('--no-render', dest='render',
-                              action='store_false',
-                              help="Whether to render the environment.")
-    parser.set_defaults(render=False)
+    parser.add_argument('--num-episodes', dest='num_episodes', type=int, default=1000000)
+    parser.add_argument('--lr', dest='lr', type=float, default=7e-4)
+    parser.add_argument('--gamma', dest='gamma', type=float, default=0.99)
+    parser.add_argument('--n', dest='n', type=int, default=10000)
 
     return parser.parse_args()
 
-
 def main(args):
-    # Parse command-line arguments.
     args = parse_arguments()
-    model_config_path = args.model_config_path
-    num_episodes = args.num_episodes
     lr = args.lr
-    critic_lr = args.critic_lr
-    n = args.n
     gamma = args.gamma
-    render = args.render
-    args_json = {
-        'num_episodes' : args.num_episodes,
-        'lr' : args.lr,
-        'critic_lr' : args.critic_lr,
-        'n' : args.n,
-        'gamma' : args.gamma,
-        'render' : args.render,
-    }
+    n = args.n
+    num_episodes = args.num_episodes
 
-    # Create the environment.
-    env = gym.make('LunarLander-v2')
+    a2c = A2C(lr, num_episodes, gamma, n)
 
-    # Load the actor model from file.
-    with open(model_config_path, 'r') as f:
-        model = keras.models.model_from_json(f.read())
-
-    a2c = A2C(
-        model,
-        lr,
-        critic_model(),
-        critic_lr,
-    )
-
-    training_episodes = num_episodes
-    current_episode = 0
-
-    if args.test != '':
-        a2c.saver.restore(sess, args.test)
-        rewards = []
-        for i in range(10):
-            rewards.append(sum(a2c.generate_episode(env)[2]))
-        print('Reward: %f +/- %f' % (np.mean(rewards), np.std(rewards)))
-        return
-
-    # Every k (freeze_episodes) episodes, freeze policy and run 100 test
-    # episodes, recording mean and stdev
-    freeze_episodes = 10
-    test_reward_means = []
-    test_reward_stdevs = []
-    losses = []
     rewards = []
-    steps = []
-    explosion = False
-    first_dump = True
-    batch_size = 1
-    while current_episode < training_episodes:
-        loss, _, reward, step = a2c.train(env, gamma=gamma)
-        losses.append(loss)
-        rewards.append(reward)
-        steps.append(step)
+    episode_lens = []
+    losses = []
+    critic_losses = []
+    entropies = []
+    total_iterations = 0
+    max_reward = 0
+    max_rewards = []
 
-        if reward > 200:
-            global last
+    current_total_reward = 0
+    current_total_ep_len = 0
+    current_total_loss = 0
+    current_total_critic_loss = 0
+    current_total_entropy = 0
+
+
+    '''
+    a2c.obs_arr = np.array(list(map(lambda env: env.reset(), a2c.envs)))
+    '''
+
+    for episode in range(num_episodes):
+        # 5 lives/sub-episodes per episode
+        loss, critic_loss, entropy, total_reward, episode_len, iterations = 0, \
+            0, 0, 0, 0, 0
+        for i in range(5):
+            sub_loss, sub_critic_loss, sub_entropy, sub_total_reward, sub_episode_len, sub_iterations = a2c.train()
+            loss += sub_loss
+            critic_loss += sub_critic_loss
+            entropy += sub_entropy
+            total_reward += sub_total_reward
+            episode_len += sub_episode_len
+            iterations += sub_iterations
+        total_iterations += iterations
+        entropy = entropy / 5
+        loss = loss / 5
+        critic_loss = critic_loss / 5
+        if total_reward > max_reward:
+            max_reward = total_reward
+        print('\n')
+        print('#' * 50)
+        print('Episode: %d' % episode)
+        print('Reward: %f' % total_reward)
+        print('Steps: %f' % episode_len)
+        print('Loss: %f' % loss)
+        print('Critic loss: %f' % critic_loss)
+        print('Entropy: %f' % entropy)
+        print('Iterations: %d' % iterations)
+        print('Total iterations: %d' % total_iterations)
+        print('Max reward so far: %d' % max_reward)
+
+        current_total_reward += total_reward
+        current_total_ep_len += episode_len
+        current_total_loss += loss
+        current_total_critic_loss += critic_loss
+        current_total_entropy += entropy
+
+        if episode % 100 == 0:
+            rewards.append(current_total_reward / 100)
+            episode_lens.append(current_total_ep_len / 100)
+            losses.append(current_total_loss / 100)
+            critic_losses.append(current_total_critic_loss / 100)
+            entropies.append(current_total_entropy / 100)
+            max_rewards.append(max_reward)
+
+            current_total_reward = 0
+            current_total_ep_len = 0
+            current_total_loss = 0
+            current_total_critic_loss = 0
+            current_total_entropy = 0
+
             if not os.path.exists('saves'):
                 os.mkdir('saves')
-            if last + 60*15 < time():
-                file = 'rev%s-key%s-ep%d-reward%d' % (rev, key, current_episode, np.mean(reward))
-                a2c.saver.save(sess, 'saves/' + file)
-                last = time()
+                a2c.saver.save(sess, 'saves/')
+            plt.clf()
+            rewards_line = plt.plot([100*i for i in range(len(rewards))], rewards, aa=True)
+            plt.axis([0, 100*(len(rewards)+1), 0, 200])
 
-            if first_dump == True:
-                file = 'rev%s-key%s' % (rev, key)
-                with open('saves/' + file + '.args', "w+", encoding='utf-8') as f:
-                    json.dump(args_json, f, ensure_ascii=False)
-                first_dump == False
+            plt.xlabel('Episodes')
+            plt.ylabel('Average reward per 100 episodes')
+            plt.savefig('rewards_a2c.png')
 
+            plt.clf()
+            episode_length_line = plt.plot([100*i for i in range(len(episode_lens))], episode_lens, aa=True)
+            plt.axis([0, 100*(len(episode_lens)+1), 0, 10000])
 
-        if (current_episode % freeze_episodes == 0):
-            print('#' * 50)
-            print('Episode: %d' % current_episode)
-            print('Reward: %f +/- %f' % (np.mean(rewards) / batch_size, np.std(rewards) / batch_size))
-            print('Loss: %f +/- %f' % (np.mean(losses) / batch_size, np.std(losses) / batch_size))
-            print('Steps: %d +/- %f' % (np.mean(steps) / batch_size, np.std(steps) / batch_size))
+            plt.xlabel('Episodes')
+            plt.ylabel('Average episode length per 100 episodes')
+            plt.savefig('episode_length_a2c.png')
 
-            if np.sum(np.abs(losses)) < 1e-6 or np.all(np.isnan(losses)):
-                if explosion: # no point in going further if the loss function kapoofs
-                    print('#' * 50)
-                    print('losses exploded')
-                    return
-                else:
-                    explosion = True
-            else:
-                explosion = False
+            plt.clf()
+            loss_line = plt.plot([100*i for i in range(len(losses))], losses, aa=True, label='Actor loss')
+            critic_loss_line = plt.plot([100*i for i in range(len(critic_losses))], critic_losses, aa=True, label='Critic loss')
 
-            rewards.clear()
-            losses.clear()
-            steps.clear()
+            plt.legend()
+            plt.axis([0, 100*(len(losses)+1), -0.1, 0.1])
 
-            if render:
-                a2c.generate_episode(env, render=True)
+            plt.xlabel('Episodes')
+            plt.ylabel('Average loss per 100 episodes')
+            plt.savefig('losses_a2c.png')
 
-            # total_rewards_arr = np.array(total_rewards)
-            # test_reward_means.append(np.mean(total_rewards_arr, axis=0))
-            # test_reward_stdevs.append(np.std(total_rewards_arr, axis=0))
+            plt.clf()
+            entropy_line = plt.plot([100*i for i in range(len(entropies))], entropies, aa=True)
+            plt.axis([0, 100*(len(episode_lens)+1), 0, 2])
 
-            # plt.clf()
-            # plt.errorbar(
-            #     [i*freeze_episodes for i in range(current_episode //
-            #         freeze_episodes)],
-            #     test_reward_means,
-            #     yerr=test_reward_stdevs
-            # )
-            # plt.xlabel('Number of training episodes')
-            # plt.ylabel('Average cumulative undiscounted reward per episode over \
-            #     100 test episodes')
-            # plt.savefig('a2c.png')
-            # plt.savefig('a2c.pdf')
-        current_episode += 1
+            plt.xlabel('Episodes')
+            plt.ylabel('Average entropy per 100 episodes')
+            plt.savefig('entropy_a2c.png')
+
+            plt.clf()
+            max_reward_line = plt.plot([100*i for i in range(len(max_rewards))], max_rewards, aa=True)
+            plt.axis([0, 100*(len(max_rewards)+1), 0, 500])
+
+            plt.xlabel('Episodes')
+            plt.ylabel('Max reward obtained so far')
+            plt.savefig('max_reward_a2c.png')
+
 
 
 if __name__ == '__main__':

@@ -60,7 +60,7 @@ class QNetwork():
                 self.action_ph = tf.placeholder(dtype=tf.uint8, shape=[None])
 
                 self.online_conv1 = tf.layers.conv2d(
-                        inputs=self.state_ph,
+                        inputs=tf.cast(self.state_ph, tf.float32) / 255,
                         filters=32,
                         kernel_size=[8,8],
                         strides=4,
@@ -429,6 +429,8 @@ class DQN_Agent():
         test_rewards = []
         last_20_episode_rewards = deque([])
         cur_total_reward = 0
+        episode_lens = []
+        cur_episode_len = 0
 
         prev_max_reward = 0
         best_so_far = 0
@@ -506,11 +508,14 @@ class DQN_Agent():
 
             if done:
                 if episodes % 10 == 0:
-                    print('training reward: %d loss: %f epsilon: %f' %
-                            (cur_total_reward, loss, epsilon))
-                    print('episodes: %d current updates: %d total updates %d' %
-                            (episodes, current_updates, updates))
-                    print('replay size: %d' % self.replay_memory.current_size)
+                    print('#' * 50)
+                    print('Episode %d' % episodes)
+                    print('Steps: %d' % current_updates)
+                    print('Total steps: %d' % updates)
+                    print('Training reward: %d' % cur_total_reward)
+                    print('Loss : %f' % loss)
+                    print('Epsilon %f' % epsilon)
+                    print('Replay size: %d' % self.replay_memory.current_size)
 
                 # Spend less time testing and more time training
                 if episodes % 100 == 0:
@@ -521,12 +526,13 @@ class DQN_Agent():
                         avg_reward = sum(last_20_episode_rewards) / \
                         len(last_20_episode_rewards)
 
-                    print('average training reward, 20 episodes: %f' %
+                    print('Average training reward, 20 episodes: %f' %
                         avg_reward)
 
                     cur_reward = self.test()
                     #print('test rewards: %d' % cur_reward)
                     test_rewards.append(cur_reward)
+
 
                 # last_20_episode_rewards is used for plotting training rewards
                 if len(last_20_episode_rewards) == 20:
@@ -540,19 +546,7 @@ class DQN_Agent():
                     training_rewards.append(sum(last_20_episode_rewards) /
                         len(last_20_episode_rewards))
 
-                    plt.clf()
-                    training_line = plt.plot([i*20 for i in
-                        range(len(training_rewards))], training_rewards, aa=True,
-                        label='Training rewards')
-                    test_line = plt.plot([i*100 for i in range(len(test_rewards))],
-                        test_rewards, aa=True, label='Test rewards')
-                    plt.legend()
-                    plt.axis([0, (len(training_rewards)+1)*20, 0, 50])
-
-                    plt.xlabel('Episodes (training iterations)')
-                    plt.ylabel('Average reward per episode over 20 episodes')
-                    plt.savefig('small_plot.png')
-                    plt.savefig('small_plot.pdf')
+                    episode_lens.append(cur_episode_len / 20)
 
                     plt.clf()
                     training_line = plt.plot([i*20 for i in
@@ -565,11 +559,21 @@ class DQN_Agent():
 
                     plt.xlabel('Episodes (training iterations)')
                     plt.ylabel('Average reward per episode over 20 episodes')
-                    plt.savefig('big_plot.png')
-                    plt.savefig('big_plot.pdf')
+                    plt.savefig('rewards_plot.png')
+
+                    plt.clf()
+                    episode_length_line = plt.plot([i*20 for i in range(len(episode_lens))],
+                        episode_lens, aa=True)
+                    plt.axis([0, (len(episode_lens)+1)*20, 0, 1000])
+                    plt.xlabel('Episodes (training iterations)')
+                    plt.ylabel('Average episode length over 20 episodes')
+                    plt.savefig('episode_len_plot.png')
+
+                    cur_episode_len = 0
 
 
                 episodes += 1
+                cur_episode_len += current_updates
 
                 obs = self.reset()
                 loss = None
