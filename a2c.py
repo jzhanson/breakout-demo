@@ -548,7 +548,7 @@ def main(args):
         current_total_critic_loss += critic_loss
         current_total_entropy += entropy
 
-        if episode % 100 == 0:
+        if episode % 100 == 0 and episode > 0:
             rewards.append(current_total_reward / 100)
             episode_lens.append(current_total_ep_len / 100)
             losses.append(current_total_loss / 100)
@@ -567,7 +567,7 @@ def main(args):
                 a2c.saver.save(sess, 'saves/')
             plt.clf()
             rewards_line = plt.plot([100*i for i in range(len(rewards))], rewards, aa=True)
-            plt.axis([0, 100*(len(rewards)+1), 0, 200])
+            plt.axis([0, 100*(len(rewards)+1), 0, 400])
 
             plt.xlabel('Episodes')
             plt.ylabel('Average reward per 100 episodes')
