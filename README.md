@@ -21,18 +21,8 @@ Better graphs, Tensorboard visualizations, testing, and saved model files on the
 |1      |            |            |
 |5      |            |            |
 |20     | 376        |            |
-|50     | 397        | 1020626    |
-|100    | 426 (so far)|           |
+|50     | 397        | Less than 1020626  |
+|100    | 428        | Less than 1031646  |
 |Inf    |             |           |
 
-
-It is interesting to note that after about 9000 training episodes (4M iterations) on one environment the softmax output converges to zeroes and ones and the agent performance plummets — a case of "overfitting" in reinforcement learning! Despite the learning rate decay, training is still not stable enough to continue slow improvement or even plateau. I believe there is something to be discovered in exactly why this happens and how to remedy it.
-
-The graphs are from N = 20. I have also encountered a similar issue with N = 50, but none yet with N = 100.
-
-![Entropy](./img/20_entropy.png)
-![Losses](./img/20_losses.png)
-![Episode length](./img/20_episode_length.png)
-![Max reward](./img/20_max_reward.png)
-![Average reward](./img/20_rewards.png)
 
